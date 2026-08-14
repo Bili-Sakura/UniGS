@@ -12,20 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Adapt FLUX.1-Fill-dev (DiT) to UniGS with context-token concatenation.
+"""FLUX.1-Fill-dev transformer: pack/unpack, Fill-style mask, UniGS channel concat.
 
-FLUX Fill concatenates the packed noisy latents, packed masked-image latents,
-and packed mask **along the channel axis** (384-dim tokens). UniGS instead
-follows FLUX.1 Kontext: every visual stream is a 64-dim packed token sequence,
-and streams are concatenated along the **sequence** axis. Rotary ids use the
-first coordinate to distinguish:
+FLUX.1-Fill-dev concatenates **on the packed channel axis** (last dim)::
 
-* ``0`` — noisy image (denoised)
-* ``1`` — noisy colormap (denoised)
-* ``2`` — control latent (context only)
-* ``3`` — coarse mask (context only)
+    hidden = cat(noisy_64, masked_image_64, mask_256, dim=-1)  # 384
 
-Only the image + colormap prefix is used for the flow-matching target.
+UniGS FLUX follows that style and adds a noisy colormap stream::
+
+    hidden = cat(img_64, cmap_64, control_64, mask_256, dim=-1)  # 448
+    pred   = transformer(...)  # [B, S, 128] = packed image + packed colormap
+
+A single RoPE ``img_ids`` grid is used (Fill's layout). SD 3.5, PixArt-α, and
+Z-Image keep native ``in_channels`` and use **context-token** concat instead
+— see :mod:`unigs.dit`.
 """
 
 from __future__ import annotations
@@ -38,19 +38,21 @@ import torch.nn.functional as F
 from torch import nn
 
 from .backbones import (
-    DIT_STREAM_COLORMAP,
-    DIT_STREAM_CONTROL,
-    DIT_STREAM_IMAGE,
-    DIT_STREAM_MASK,
-    FLUX_FILL_CHECKPOINT,
     FLUX_FILL_PACKED_IN_CHANNELS,
-    FLUX_LATENT_CHANNELS,
+    FLUX_FILL_PACKED_LATENT,
+    FLUX_FILL_PACKED_MASK,
     UNIGS_DIT_PACKED_IN_CHANNELS,
     UNIGS_DIT_PACKED_OUT_CHANNELS,
+    family_from_pretrained,
+    infer_transformer_family,
 )
 
 
 logger = logging.getLogger(__name__)
+
+_FILL_MASK_FOLD = 8
+_FILL_PACK_H = 2
+_FILL_PACK_W = 2
 
 
 def pack_latents(
@@ -114,7 +116,11 @@ def prepare_latent_ids(
     dtype: torch.dtype,
     stream_id: int = 0,
 ) -> torch.Tensor:
-    """3D RoPE ids of shape ``[packed_height * packed_width, 3]`` = ``(t, h, w)``."""
+    """3D RoPE ids of shape ``[packed_height * packed_width, 3]`` = ``(t, h, w)``.
+
+    Fill-style UniGS uses a **single** stream (``stream_id=0``); extra ids were
+    only needed for sequence-concat.
+    """
     latent_ids = torch.zeros(packed_height, packed_width, 3, device=device, dtype=dtype)
     latent_ids[..., 0] = float(stream_id)
     latent_ids[..., 1] = latent_ids[..., 1] + torch.arange(packed_height, device=device, dtype=dtype)[:, None]
@@ -122,73 +128,70 @@ def prepare_latent_ids(
     return latent_ids.reshape(packed_height * packed_width, 3)
 
 
-def pack_mask_as_tokens(
-    mask: torch.Tensor,
-    latent_height: int,
-    latent_width: int,
-    latent_channels: int = FLUX_LATENT_CHANNELS,
+def prepare_latent_image_ids(
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Resize a coarse mask to the latent grid and pack it as 64-dim tokens.
+    """RoPE ids for one packed Fill stream from **latent** HxW."""
+    return prepare_latent_ids(height // _FILL_PACK_H, width // _FILL_PACK_W, device, dtype, stream_id=0)
 
-    The mask is repeated across ``latent_channels`` so it shares the UniGS DiT
-    ``x_embedder`` (64-in) with image / colormap / control tokens. Spatial RoPE
-    matches the other streams; the stream id distinguishes it.
+
+def fold_fill_mask(mask: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Fold a pixel-space mask into 64 channels at latent HxW (Fill's ``prepare_mask_latents``).
+
+    ``mask`` is ``[B, 1, H_pix, W_pix]``. Fill interpolates to ``(H*8, W*8)``,
+    then views 8×8 neighborhoods as extra channels::
+
+        [B, 1, 8H, 8W] → [B, 64, H, W]
     """
     if mask.ndim == 3:
         mask = mask.unsqueeze(1)
-    mask = F.interpolate(mask.float(), size=(latent_height, latent_width), mode="nearest")
-    mask = mask.expand(-1, latent_channels, -1, -1)
-    return pack_latents(mask, mask.shape[0], latent_channels, latent_height, latent_width)
-
-
-def concat_context_tokens(
-    image_tokens: torch.Tensor,
-    colormap_tokens: torch.Tensor,
-    control_tokens: torch.Tensor,
-    mask_tokens: torch.Tensor,
-    packed_height: int,
-    packed_width: int,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Sequence-concat UniGS DiT streams.
-
-    Returns:
-        hidden_states: ``[B, 4S, 64]``
-        img_ids: ``[4S, 3]``
-        target_seq_len: ``2S`` (image + colormap; condition tokens are dropped
-            from the transformer output before the scheduler step)
-    """
-    for name, tokens in (
-        ("image", image_tokens),
-        ("colormap", colormap_tokens),
-        ("control", control_tokens),
-        ("mask", mask_tokens),
-    ):
-        if tokens.ndim != 3:
-            raise ValueError(f"{name} tokens must be packed `[B, S, C]`, got {tuple(tokens.shape)}")
-
-    hidden_states = torch.cat([image_tokens, colormap_tokens, control_tokens, mask_tokens], dim=1)
-    device, dtype = image_tokens.device, image_tokens.dtype
-    img_ids = torch.cat(
-        [
-            prepare_latent_ids(packed_height, packed_width, device, dtype, DIT_STREAM_IMAGE),
-            prepare_latent_ids(packed_height, packed_width, device, dtype, DIT_STREAM_COLORMAP),
-            prepare_latent_ids(packed_height, packed_width, device, dtype, DIT_STREAM_CONTROL),
-            prepare_latent_ids(packed_height, packed_width, device, dtype, DIT_STREAM_MASK),
-        ],
-        dim=0,
+    if mask.shape[1] != 1:
+        mask = mask[:, :1]
+    target_h = height * _FILL_MASK_FOLD
+    target_w = width * _FILL_MASK_FOLD
+    if mask.shape[-2:] != (target_h, target_w):
+        mask = F.interpolate(mask.float(), size=(target_h, target_w), mode="nearest")
+    batch = mask.shape[0]
+    return (
+        mask.view(batch, height, _FILL_MASK_FOLD, width, _FILL_MASK_FOLD)
+        .permute(0, 2, 4, 1, 3)
+        .reshape(batch, _FILL_MASK_FOLD * _FILL_MASK_FOLD, height, width)
     )
-    target_seq_len = image_tokens.shape[1] + colormap_tokens.shape[1]
-    return hidden_states, img_ids, target_seq_len
 
 
-def split_target_tokens(
-    model_pred: torch.Tensor,
-    target_seq_len: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Drop context-token predictions and split image / colormap packed outputs."""
-    target = model_pred[:, :target_seq_len]
-    seq = target_seq_len // 2
-    return target[:, :seq], target[:, seq:]
+def pack_fill_mask(mask: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Pixel (or latent) mask → packed Fill mask tokens ``[B, S, 256]``."""
+    return pack_latents(fold_fill_mask(mask, height, width))
+
+
+def concat_fill_channels(
+    packed_image: torch.Tensor,
+    packed_colormap: torch.Tensor,
+    packed_control: torch.Tensor,
+    packed_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Fill-style last-dim concat: ``[B, S, 448] = 64+64+64+256``."""
+    for name, tensor, channels in (
+        ("image", packed_image, FLUX_FILL_PACKED_LATENT),
+        ("colormap", packed_colormap, FLUX_FILL_PACKED_LATENT),
+        ("control", packed_control, FLUX_FILL_PACKED_LATENT),
+        ("mask", packed_mask, FLUX_FILL_PACKED_MASK),
+    ):
+        if tensor.ndim != 3 or tensor.shape[-1] != channels:
+            raise ValueError(f"{name} packed channels must be {channels}, got {tuple(tensor.shape)}")
+    return torch.cat([packed_image, packed_colormap, packed_control, packed_mask], dim=-1)
+
+
+def split_packed_pred(packed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split ``[B, S, 128]`` transformer output into packed image + colormap (64 each)."""
+    if packed.shape[-1] != UNIGS_DIT_PACKED_OUT_CHANNELS:
+        raise ValueError(
+            f"expected packed pred last dim {UNIGS_DIT_PACKED_OUT_CHANNELS}, got {packed.shape[-1]}"
+        )
+    return packed[..., :FLUX_FILL_PACKED_LATENT], packed[..., FLUX_FILL_PACKED_LATENT:]
 
 
 def vae_shift(vae) -> float:
@@ -225,76 +228,123 @@ def calculate_shift(
     return image_seq_len * m + b
 
 
-def adapt_unigs_transformer(transformer, zero_init: bool = True):
-    """Map FLUX Fill's 384-in channel-concat embedder to UniGS 64-in token concat.
+def _copy_linear_out(src: nn.Linear, dst: nn.Linear) -> None:
+    """Copy overlapping output rows; extra UniGS rows stay at their init (zeros)."""
+    with torch.no_grad():
+        dst.weight.zero_()
+        n_out = min(src.weight.shape[0], dst.weight.shape[0])
+        dst.weight[:n_out] = src.weight[:n_out]
+        if src.bias is not None and dst.bias is not None:
+            dst.bias.zero_()
+            dst.bias[:n_out] = src.bias[:n_out]
 
-    Fill ``x_embedder`` is ``Linear(384, inner_dim)`` over
-    ``cat(noisy, masked_image, mask)`` packed channels. UniGS keeps only the
-    first 64 columns — the packed noisy-latent projection — so every visual
-    stream (image, colormap, control, mask) shares the same 64-dim embedder
-    and is distinguished in sequence + RoPE instead of in channels.
 
-    Already-adapted UniGS DiT checkpoints (64 in / 64 out) are returned as-is.
+def _copy_fill_x_embedder(src: nn.Linear, dst: nn.Linear) -> None:
+    """Map Fill 384-in weights onto UniGS 448-in layout.
+
+    Fill:  ``[noisy_64 | masked_image_64 | mask_256]``
+    UniGS: ``[img_64 | cmap_64 | control_64 | mask_256]``
+
+    Image and mask columns copy 1:1. Fill's masked-image columns become UniGS
+    control. Colormap columns stay zero-init. A previous UniGS 64-in (token
+    concat) checkpoint copies into the image slot only.
     """
-    old_in = int(transformer.config.in_channels)
-    old_out = int(getattr(transformer.config, "out_channels", None) or old_in)
+    src_in = src.weight.shape[1]
+    dst_in = dst.weight.shape[1]
+    with torch.no_grad():
+        dst.weight.zero_()
+        if src_in == FLUX_FILL_PACKED_IN_CHANNELS and dst_in == UNIGS_DIT_PACKED_IN_CHANNELS:
+            dst.weight[:, 0:64] = src.weight[:, 0:64]
+            dst.weight[:, 128:192] = src.weight[:, 64:128]
+            dst.weight[:, 192:448] = src.weight[:, 128:384]
+        elif src_in == FLUX_FILL_PACKED_LATENT and dst_in == UNIGS_DIT_PACKED_IN_CHANNELS:
+            dst.weight[:, :FLUX_FILL_PACKED_LATENT] = src.weight
+        else:
+            n_in = min(src_in, dst_in)
+            dst.weight[:, :n_in] = src.weight[:, :n_in]
+        if src.bias is not None and dst.bias is not None:
+            dst.bias.copy_(src.bias)
 
-    if old_in == UNIGS_DIT_PACKED_IN_CHANNELS and old_out == UNIGS_DIT_PACKED_OUT_CHANNELS:
-        logger.info("Transformer already has UniGS DiT packed channels (64 in / 64 out).")
+
+def _guess_flux_family(transformer) -> bool:
+    in_ch = int(getattr(getattr(transformer, "config", None), "in_channels", 0) or 0)
+    return hasattr(transformer, "x_embedder") and in_ch in {
+        FLUX_FILL_PACKED_IN_CHANNELS,
+        UNIGS_DIT_PACKED_IN_CHANNELS,
+        FLUX_FILL_PACKED_LATENT,
+    }
+
+
+def adapt_unigs_transformer(transformer, zero_init: bool = True, family: Optional[str] = None, pretrained: Optional[str] = None):
+    """Adapt a DiT to UniGS.
+
+    * **FLUX.1-Fill-dev** — Fill-style channel concat: ``x_embedder`` 384→448,
+      ``proj_out`` 64→128, with Fill column remapping.
+    * **SD 3.5 / PixArt-α** — keep native ``in_channels``; register a zero-init
+      ``unigs_stream_embed`` so stream 0 matches the pretrained image path.
+    * **Z-Image** — keep native omni embedders; mark ``unigs_dit_family``.
+    """
+    del zero_init  # extra FLUX channels are always zero-init then overwritten where pretrained
+    family = family or family_from_pretrained(pretrained, transformer) or infer_transformer_family(transformer)
+    if family is None and _guess_flux_family(transformer):
+        family = "flux"
+    if family is None:
+        raise TypeError(
+            "Cannot infer DiT family for UniGS adapter; pass family='flux'|'sd3'|'z_image'|'pixart'."
+        )
+
+    if family in {"sd3", "pixart", "z_image"}:
+        from .dit import ensure_unigs_stream_embed
+
+        if family in {"sd3", "pixart"}:
+            ensure_unigs_stream_embed(transformer)
+        if hasattr(transformer, "register_to_config"):
+            transformer.register_to_config(unigs_dit_family=family)
+        elif hasattr(transformer, "config"):
+            transformer.config.unigs_dit_family = family
+        logger.info("Registered UniGS token-concat adapter on %s DiT (native in_channels).", family)
         return transformer
 
-    if old_in not in (FLUX_FILL_PACKED_IN_CHANNELS, UNIGS_DIT_PACKED_IN_CHANNELS):
-        raise ValueError(
-            f"Unsupported FluxTransformer `in_channels={old_in}`. Expected "
-            f"{FLUX_FILL_PACKED_IN_CHANNELS} (FLUX.1-Fill-dev channel concat) or "
-            f"{UNIGS_DIT_PACKED_IN_CHANNELS} (UniGS token concat). "
-            f"Use `{FLUX_FILL_CHECKPOINT}`."
-        )
+    in_ch = int(getattr(transformer.config, "in_channels", 0))
+    out_ch = int(getattr(transformer.config, "out_channels", 0))
+    if in_ch == UNIGS_DIT_PACKED_IN_CHANNELS and out_ch == UNIGS_DIT_PACKED_OUT_CHANNELS:
+        if hasattr(transformer, "register_to_config"):
+            transformer.register_to_config(unigs_dit_family="flux")
+        return transformer
 
+    inner_dim = transformer.x_embedder.weight.shape[0]
+    old_x = transformer.x_embedder
+    transformer.x_embedder = nn.Linear(UNIGS_DIT_PACKED_IN_CHANNELS, inner_dim)
+    nn.init.zeros_(transformer.x_embedder.weight)
+    if transformer.x_embedder.bias is not None:
+        nn.init.zeros_(transformer.x_embedder.bias)
+    _copy_fill_x_embedder(old_x, transformer.x_embedder)
+
+    old_out = transformer.proj_out
+    transformer.proj_out = nn.Linear(inner_dim, UNIGS_DIT_PACKED_OUT_CHANNELS)
+    nn.init.zeros_(transformer.proj_out.weight)
+    if transformer.proj_out.bias is not None:
+        nn.init.zeros_(transformer.proj_out.bias)
+    _copy_linear_out(old_out, transformer.proj_out)
+
+    transformer.config.in_channels = UNIGS_DIT_PACKED_IN_CHANNELS
+    transformer.config.out_channels = UNIGS_DIT_PACKED_OUT_CHANNELS
+    if hasattr(transformer, "register_to_config"):
+        transformer.register_to_config(
+            in_channels=UNIGS_DIT_PACKED_IN_CHANNELS,
+            out_channels=UNIGS_DIT_PACKED_OUT_CHANNELS,
+            unigs_dit_family="flux",
+        )
     logger.info(
-        "Adapting FLUX Fill transformer from %s-in/%s-out packed channels to UniGS "
-        "DiT %s-in/%s-out (context-token concat, copy noisy-latent embedder=%s).",
-        old_in,
-        old_out,
+        "Adapted FLUX Fill transformer to UniGS channel concat (%s→%s in, %s→%s out).",
+        in_ch,
         UNIGS_DIT_PACKED_IN_CHANNELS,
+        out_ch,
         UNIGS_DIT_PACKED_OUT_CHANNELS,
-        zero_init,
     )
-
-    if old_in != UNIGS_DIT_PACKED_IN_CHANNELS:
-        old_embed = transformer.x_embedder
-        new_embed = nn.Linear(
-            UNIGS_DIT_PACKED_IN_CHANNELS,
-            old_embed.out_features,
-            bias=old_embed.bias is not None,
-        )
-        new_embed = new_embed.to(device=old_embed.weight.device, dtype=old_embed.weight.dtype)
-        with torch.no_grad():
-            # Fill layout: [noisy(64), masked_image(64), mask(256)]. Keep noisy.
-            new_embed.weight.copy_(old_embed.weight[:, :UNIGS_DIT_PACKED_IN_CHANNELS])
-            if new_embed.bias is not None and old_embed.bias is not None:
-                new_embed.bias.copy_(old_embed.bias)
-            elif new_embed.bias is not None:
-                new_embed.bias.zero_()
-        transformer.x_embedder = new_embed
-        transformer.register_to_config(in_channels=UNIGS_DIT_PACKED_IN_CHANNELS)
-
-    if old_out != UNIGS_DIT_PACKED_OUT_CHANNELS:
-        old_proj = transformer.proj_out
-        patch_size = int(getattr(transformer.config, "patch_size", 1) or 1)
-        new_out_features = patch_size * patch_size * UNIGS_DIT_PACKED_OUT_CHANNELS
-        new_proj = nn.Linear(old_proj.in_features, new_out_features, bias=old_proj.bias is not None)
-        new_proj = new_proj.to(device=old_proj.weight.device, dtype=old_proj.weight.dtype)
-        with torch.no_grad():
-            new_proj.weight.zero_()
-            rows = min(old_proj.weight.shape[0], new_proj.weight.shape[0])
-            new_proj.weight[:rows].copy_(old_proj.weight[:rows])
-            if new_proj.bias is not None and old_proj.bias is not None:
-                new_proj.bias.zero_()
-                new_proj.bias[: min(old_proj.bias.shape[0], new_proj.bias.shape[0])].copy_(
-                    old_proj.bias[: min(old_proj.bias.shape[0], new_proj.bias.shape[0])]
-                )
-        transformer.proj_out = new_proj
-        transformer.register_to_config(out_channels=UNIGS_DIT_PACKED_OUT_CHANNELS)
-
     return transformer
+
+
+def maybe_adapt_unigs_transformer(transformer, family: Optional[str] = None, pretrained: Optional[str] = None):
+    """Idempotent :func:`adapt_unigs_transformer`."""
+    return adapt_unigs_transformer(transformer, family=family, pretrained=pretrained)

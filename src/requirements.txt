@@ -1,5 +1,5 @@
 accelerate>=0.27.0
-diffusers>=0.32.0
+diffusers>=0.32.0  # Z-Image needs a build with ZImageTransformer2DModel (newer wheel or from source)
 transformers>=4.44.0
 datasets>=2.16.0
 huggingface_hub>=0.20.0

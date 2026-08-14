@@ -26,20 +26,20 @@ from .backbones import (
     BACKBONES,
     DEFAULT_BACKBONE,
     DIT_BACKBONES,
+    DIT_FAMILY_CHECKPOINTS,
     FLUX_FILL_CHECKPOINT,
-    INPAINTING_BACKBONES,
     INPAINTING_UNET_IN_CHANNELS,
     UNET_BACKBONES,
     is_dit_checkpoint,
     resolve_backbone,
-    resolve_inpainting_checkpoint,
+    resolve_dit_family,
 )
 from .coarse_mask import CoarseMaskGenerator
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .dataset import UniGSInstanceDataset, collate_fn
 from .pipeline_unigs import UniGSPipeline, UniGSPipelineOutput
 from .prompts import TASK_PROMPT_TEMPLATES, build_task_prompt
-from .transformer import adapt_unigs_transformer, concat_context_tokens, pack_latents
+from .transformer import adapt_unigs_transformer, concat_fill_channels, pack_latents
 from .unet import UNIGS_IN_CHANNELS, UNIGS_OUT_CHANNELS, adapt_unigs_unet
 
 try:
@@ -48,19 +48,37 @@ except ImportError:  # Diffusers without FLUX
     UniGSFluxPipeline = None  # type: ignore[misc, assignment]
     encode_flux_prompt = None  # type: ignore[misc, assignment]
 
+try:
+    from .pipeline_unigs_sd3 import UniGSSD3Pipeline
+except ImportError:
+    UniGSSD3Pipeline = None  # type: ignore[misc, assignment]
+
+try:
+    from .pipeline_unigs_zimage import UniGSZImagePipeline
+except ImportError:
+    UniGSZImagePipeline = None  # type: ignore[misc, assignment]
+
+try:
+    from .pipeline_unigs_pixart import UniGSPixArtPipeline
+except ImportError:
+    UniGSPixArtPipeline = None  # type: ignore[misc, assignment]
+
 
 __all__ = [
     "BACKBONES",
     "CoarseMaskGenerator",
     "DEFAULT_BACKBONE",
     "DIT_BACKBONES",
+    "DIT_FAMILY_CHECKPOINTS",
     "FLUX_FILL_CHECKPOINT",
-    "INPAINTING_BACKBONES",
     "INPAINTING_UNET_IN_CHANNELS",
     "LocationAwarePalette",
     "ProgressiveDichotomyModule",
     "UNET_BACKBONES",
     "UniGSFluxPipeline",
+    "UniGSSD3Pipeline",
+    "UniGSPixArtPipeline",
+    "UniGSZImagePipeline",
     "UniGSInstanceDataset",
     "UniGSPipeline",
     "UniGSPipelineOutput",
@@ -71,10 +89,10 @@ __all__ = [
     "adapt_unigs_unet",
     "build_task_prompt",
     "collate_fn",
-    "concat_context_tokens",
+    "concat_fill_channels",
     "encode_flux_prompt",
     "is_dit_checkpoint",
     "pack_latents",
     "resolve_backbone",
-    "resolve_inpainting_checkpoint",
+    "resolve_dit_family",
 ]

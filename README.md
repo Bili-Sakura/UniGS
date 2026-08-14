@@ -1,6 +1,6 @@
 # UniGS
 
-Unofficial implementation of [UniGS: Unified Representation for Image Generation and Segmentation](https://arxiv.org/abs/2312.01985) on **Stable Diffusion inpainting** UNets (SD 1.5 / 2.1) and **FLUX.1-Fill-dev** (DiT), written in native 🤗 Diffusers style so it can be dropped into `examples/research_projects/unigs` (training) and `examples/community` (inference) with almost no changes.
+Unofficial implementation of [UniGS: Unified Representation for Image Generation and Segmentation](https://arxiv.org/abs/2312.01985) on **Stable Diffusion inpainting** UNets (SD 1.5 / 2.1) and several **DiT** backbones, written in native 🤗 Diffusers style so it can be dropped into `examples/research_projects/unigs` (training) and `examples/community` (inference) with almost no changes.
 
 UniGS treats entity-level masks as an RGB **colormap** that lives in the same VAE latent space as images. A dual-output UNet denoises both jointly inside an inpainting protocol, which is enough to cover four tasks from one representation:
 
@@ -18,16 +18,26 @@ The UNet starts from the standard SD **inpainting** `UNet2DConditionModel` (9 in
 
 Newly added `conv_in` / `conv_out` weights are zero-initialized. Existing inpainting channels (noisy image, mask, control latent) are copied from the pretrained UNet; colormap channels are zero-initialized — matching the paper.
 
-**FLUX.1-Fill-dev (DiT).** Fill's native condition is channel-concat of packed noisy latents, masked-image latents, and mask (`in_channels=384`). UniGS instead follows FLUX.1 Kontext: every stream is a 64-dim packed token sequence, concatenated on the **sequence** axis, with RoPE ids `(t, h, w)`:
+**FLUX.1-Fill-dev (DiT).** Fill's native condition is packed **channel** concat of noisy latents, masked-image latents, and the folded mask (`in_channels=384`). UniGS keeps that style and adds a noisy colormap stream:
 
-* `t=0` noisy image (denoised)
-* `t=1` noisy colormap (denoised)
-* `t=2` control latent (context only)
-* `t=3` coarse mask (context only)
+```
+hidden = cat(img_64, cmap_64, control_64, mask_256, dim=-1)  # 448
+pred   = transformer(...)                                   # [B, S, 128]
+```
 
-`x_embedder` is shrunk 384→64 by copying Fill's packed noisy-latent columns. Text is CLIP pooled + T5; training is flow matching.
+`x_embedder` is expanded 384→448: Fill's noisy-image and mask columns copy 1:1, Fill's masked-image columns become UniGS control, colormap columns are zero-init. `proj_out` is expanded 64→128 (colormap rows zero-init). A single RoPE `img_ids` grid is used (no extra stream ids). Text is CLIP pooled + T5; training is flow matching.
 
-Base text-to-image checkpoints (`stable-diffusion-v1-5`, `stable-diffusion-2-1`, `FLUX.1-dev`, etc.) are **not** supported.
+**Other DiT backbones (text-to-image is OK).** There is no inpainting SD 3.5 / Z-Image / PixArt-α checkpoint in the UniGS protocol. Those models keep **native** `in_channels` and condition with extra visual **context tokens**, not Fill-style channel concat:
+
+| Family | Default Hub id | How condition is injected | Objective |
+| --- | --- | --- | --- |
+| SD 3.5 Medium | `stabilityai/stable-diffusion-3.5-medium` | patch-embed each stream at native HxW, add a zero-init stream embedding, concat sequences, unpatchify image+colormap | flow matching (CLIP-L + CLIP-G + T5) |
+| Z-Image | `Tongyi-MAI/Z-Image-Turbo` | native omni nested list: clean control + mask, noisy image+colormap stacked on height (omni unpatchify returns only the last stream) | flow matching (Qwen; output negated like `ZImagePipeline`) |
+| PixArt-α | `PixArt-alpha/PixArt-XL-2-512-MS` | same pos-embed-then-sequence-concat as SD3; 1024-MS needs `resolution` / `aspect_ratio` micro-conditions | epsilon diffusion (T5) |
+
+SD3 cannot spatially stack four 64×64 streams: `pos_embed_max_size=96`. Sequence concat after `PatchEmbed` avoids that limit.
+
+Base text-to-image **UNets** (`stable-diffusion-v1-5`, `stable-diffusion-2-1`, etc.) are **not** supported. DiT text-to-image checkpoints listed above are.
 
 ## Layout
 
@@ -36,20 +46,26 @@ This tree is intentionally close to a Diffusers research example:
 ```
 src/
   train_unigs.py              # Accelerate trainer (like examples/instruct_pix2pix)
-  infer_unigs.py              # CLI around the pipeline
+  infer_unigs.py              # CLI around the per-model pipelines
   requirements.txt
   unigs/
-    pipeline_unigs.py         # DiffusionPipeline (community-pipeline style)
-    pipeline_unigs_flux.py    # FLUX Fill DiT pipeline (context-token concat)
-    backbones.py              # sd15 / sd21 / flux Hub ids
+    pipeline_unigs.py         # UniGSPipeline (SD 1.5 / 2.1 inpainting UNet)
+    pipeline_unigs_flux.py    # UniGSFluxPipeline (Fill-style channel concat)
+    pipeline_unigs_sd3.py     # UniGSSD3Pipeline (context-token concat)
+    pipeline_unigs_zimage.py  # UniGSZImagePipeline (omni context tokens)
+    pipeline_unigs_pixart.py  # UniGSPixArtPipeline (context-token concat)
+    pipeline_unigs_common.py  # shared task / latent helpers
+    pipelines.py              # pick class from `_class_name` / family, then from_pretrained
+    backbones.py              # train/infer Hub-id shorthands
     unet.py                   # 9 → 13-in, 4 → 8-out adapter
-    transformer.py            # Fill 384-in → UniGS 64-in token-concat adapter
+    transformer.py            # Fill 384-in → UniGS 448-in channel-concat adapter
+    dit.py                    # SD3 / PixArt sequence concat + Z-Image omni
     colormap.py               # location-aware palette Ψ + progressive dichotomy Φ
     coarse_mask.py            # Ω, Bezier / extended-bbox coarse masks
     prompts.py                # Table 2 templates
     dataset.py                # COCO / 🤗 Datasets → UniGS batches
 tests/
-  test_dit_tokens.py          # pack / RoPE ids / Fill→64-in adapter
+  test_dit_tokens.py          # FLUX pack / Fill 448-in concat / SD3 stream embed / Z-Image omni
 ```
 
 ## Installation
@@ -58,15 +74,19 @@ tests/
 pip install -r src/requirements.txt
 ```
 
-Supported inpainting backbones (use `--backbone` or pass the Hub id explicitly):
+Each model family has its own pipeline class loaded with Diffusers `from_pretrained`. Training `--backbone` is only a Hub-id shorthand:
 
 | Shorthand | Checkpoint | Conditioning |
 | --- | --- | --- |
 | `sd15` (paper default) | `stable-diffusion-v1-5/stable-diffusion-inpainting` | channel concat (13-in UNet) |
 | `sd21` | `stabilityai/stable-diffusion-2-inpainting` | channel concat (13-in UNet) |
-| `flux` / `flux_fill` | `black-forest-labs/FLUX.1-Fill-dev` | context-token concat (64-in DiT) |
+| `flux` / `flux_fill` | `black-forest-labs/FLUX.1-Fill-dev` | channel concat (448-in packed DiT, Fill-style) |
+| `sd3` / `sd3.5` / `sd35` | `stabilityai/stable-diffusion-3.5-medium` | context-token concat (native 16-ch MMDiT) |
+| `z_image` / `z-image` | `Tongyi-MAI/Z-Image-Turbo` | omni context-token concat (native 16-ch) |
+| `pixart` / `pixart_alpha` | `PixArt-alpha/PixArt-XL-2-512-MS` | context-token concat (native 4-ch DiT) |
+| `pixart_1024` | `PixArt-alpha/PixArt-XL-2-1024-MS` | same, with resolution micro-conditions |
 
-FLUX.1-Fill-dev is gated — accept the license on the Hub and `hf auth login` before training or bootstrapping.
+FLUX.1-Fill-dev and SD 3.5 Medium are gated — accept the license on the Hub and `hf auth login` before training or bootstrapping. Z-Image needs a Diffusers build that includes `ZImageTransformer2DModel` (recent release or install from source).
 
 ## Training
 
@@ -108,9 +128,9 @@ accelerate launch src/train_unigs.py \
 
 `--task` can be `inpainting`, `synthesis`, `referring`, `entity`, or `joint` (sample ratios 0.3 / 0.3 / 0.2 / 0.2 from the supplementary). Referring training randomly replaces category names with negatives (`--referring_neg_prob`) so the text prompt has to match the coarse-mask region.
 
-The run writes a full `UniGSPipeline` via `save_pretrained`, so the UNet config records `in_channels=13` and `out_channels=8`.
+The run writes a full `UniGSPipeline` via `save_pretrained`, so the UNet config records `in_channels=13` and `out_channels=8`. DiT runs write the matching class (`UniGSFluxPipeline`, `UniGSSD3Pipeline`, `UniGSZImagePipeline`, or `UniGSPixArtPipeline`).
 
-FLUX.1-Fill-dev (context-token concat; LoRA is recommended because the transformer is 12B):
+FLUX.1-Fill-dev (Fill-style channel concat; LoRA is recommended because the transformer is 12B):
 
 ```bash
 accelerate launch src/train_unigs.py \
@@ -131,7 +151,58 @@ accelerate launch src/train_unigs.py \
   --conditioning_dropout_prob=0.1
 ```
 
-Resolution must be divisible by 16 (8× VAE and 2×2 packing). The saved pipeline is a `UniGSFluxPipeline` with `transformer.in_channels=64`.
+Resolution must be divisible by 16 (8× VAE and 2×2 packing). The saved pipeline is a `UniGSFluxPipeline` with `transformer.in_channels=448`.
+
+SD 3.5 Medium (context-token concat after patch embed; T5-XXL is large — LoRA recommended):
+
+```bash
+accelerate launch src/train_unigs.py \
+  --backbone=sd3 \
+  --coco_image_dir=/data/coco/train2017 \
+  --coco_annotation_file=/data/coco/annotations/instances_train2017.json \
+  --output_dir=unigs-sd35-medium \
+  --resolution=512 \
+  --train_batch_size=1 \
+  --gradient_accumulation_steps=4 \
+  --learning_rate=1e-4 \
+  --lora_rank=16 \
+  --max_train_steps=10000 \
+  --mixed_precision=bf16 \
+  --gradient_checkpointing \
+  --task=joint
+```
+
+Z-Image Turbo (omni context tokens; distilled, default guidance 0):
+
+```bash
+accelerate launch src/train_unigs.py \
+  --backbone=z_image \
+  --coco_image_dir=/data/coco/train2017 \
+  --coco_annotation_file=/data/coco/annotations/instances_train2017.json \
+  --output_dir=unigs-z-image \
+  --resolution=512 \
+  --train_batch_size=1 \
+  --lora_rank=16 \
+  --mixed_precision=bf16 \
+  --gradient_checkpointing \
+  --task=joint
+```
+
+PixArt-α 512 (epsilon diffusion, T5 only):
+
+```bash
+accelerate launch src/train_unigs.py \
+  --backbone=pixart \
+  --coco_image_dir=/data/coco/train2017 \
+  --coco_annotation_file=/data/coco/annotations/instances_train2017.json \
+  --output_dir=unigs-pixart \
+  --resolution=512 \
+  --train_batch_size=2 \
+  --lora_rank=16 \
+  --mixed_precision=fp16 \
+  --gradient_checkpointing \
+  --task=joint
+```
 
 ## Inference
 
@@ -154,15 +225,33 @@ out.colormaps[0].save("colormap.png")
 # out.masks is a list of binary entity maps from the progressive dichotomy module
 ```
 
-Bootstrap directly from an inpainting checkpoint (channels expanded; weights are pretrained-inpainting + zero-init colormap branches — fine-tune before serious use):
+Bootstrap from a base Hub checkpoint (adapters applied inside `from_pretrained`; fine-tune before serious use):
 
 ```python
-from unigs import UniGSPipeline
+from unigs import (
+    UniGSFluxPipeline,
+    UniGSPipeline,
+    UniGSPixArtPipeline,
+    UniGSSD3Pipeline,
+    UniGSZImagePipeline,
+)
 
-pipe = UniGSPipeline.from_inpainting(backbone="sd15", torch_dtype=torch.float16)
-# or: UniGSPipeline.from_inpainting("stabilityai/stable-diffusion-2-inpainting")
-# DiT: UniGSPipeline.from_inpainting(backbone="flux", torch_dtype=torch.bfloat16)
-#   dispatches to UniGSFluxPipeline (context-token concat).
+pipe = UniGSPipeline.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-inpainting", torch_dtype=torch.float16
+)
+pipe = UniGSPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-2-inpainting", torch_dtype=torch.float16
+)
+pipe = UniGSFluxPipeline.from_pretrained(
+    "black-forest-labs/FLUX.1-Fill-dev", torch_dtype=torch.bfloat16
+)
+pipe = UniGSSD3Pipeline.from_pretrained(
+    "stabilityai/stable-diffusion-3.5-medium", torch_dtype=torch.bfloat16
+)
+pipe = UniGSZImagePipeline.from_pretrained("Tongyi-MAI/Z-Image-Turbo", torch_dtype=torch.bfloat16)
+pipe = UniGSPixArtPipeline.from_pretrained(
+    "PixArt-alpha/PixArt-XL-2-512-MS", torch_dtype=torch.float16
+)
 ```
 
 The other Table-2 tasks:
@@ -173,11 +262,11 @@ out = pipe.referring("dog", image=image, mask_image=region)
 out = pipe.segment(image)  # entity / panoptic
 ```
 
-CLI:
+CLI (`--pipeline` selects which class to `from_pretrained` when the path is a base Hub checkpoint):
 
 ```bash
 python src/infer_unigs.py \
-  --backbone sd15 \
+  --pipeline sd15 \
   --task inpainting \
   --prompt dog \
   --image scene.png \
@@ -189,7 +278,7 @@ FLUX Fill (guidance default 30; bf16 recommended):
 
 ```bash
 python src/infer_unigs.py \
-  --backbone flux \
+  --pipeline flux \
   --task inpainting \
   --prompt dog \
   --image scene.png \
@@ -197,6 +286,21 @@ python src/infer_unigs.py \
   --dtype bf16 \
   --output-dir out
 ```
+
+SD 3.5 Medium (guidance default 4.5):
+
+```bash
+python src/infer_unigs.py \
+  --pipeline sd3 \
+  --task inpainting \
+  --prompt dog \
+  --image scene.png \
+  --mask hole.png \
+  --dtype bf16 \
+  --output-dir out
+```
+
+Z-Image (guidance default 0) and PixArt-α (guidance default 4.5) use the same CLI with `--pipeline z_image` or `--pipeline pixart`.
 
 ## Method notes
 
@@ -206,14 +310,14 @@ python src/infer_unigs.py \
 
 **Coarse mask (Ω).** With probability `--arbitrary_mask_prob` a quadratic-Bezier blob is drawn around the entity bbox (Paint-by-Example / supplementary Alg. 1); otherwise an extended rectangle is used. Synthesis and entity segmentation pass an all-ones mask.
 
-**VAE.** Colormaps are encoded and decoded with the same `AutoencoderKL` as RGB images. SD inpainting uses an 8× VAE downscale (`vae_scale_factor`). FLUX uses the 16-channel Fill VAE plus 2×2 token packing.
+**VAE.** Colormaps are encoded and decoded with the same `AutoencoderKL` as RGB images. SD inpainting and PixArt-α use an 8× VAE downscale (`vae_scale_factor`). FLUX Fill, SD 3.5, and Z-Image use a 16-channel VAE; FLUX/Z-Image also pack 2×2 tokens.
 
 ## Mapping onto Diffusers
 
 To upstream this as an official example:
 
-1. Move `src/unigs/pipeline_unigs.py` → `examples/community/pipeline_unigs.py` (inline the small helpers, or keep the package).
+1. Move each `src/unigs/pipeline_unigs*.py` → `examples/community/` (keep one file per model family).
 2. Move `src/train_unigs.py` + `src/unigs/` → `examples/research_projects/unigs/`.
-3. Load with `DiffusionPipeline.from_pretrained(..., custom_pipeline="pipeline_unigs")` once the community file is in tree.
+3. Load with `DiffusionPipeline.from_pretrained(..., custom_pipeline="pipeline_unigs")` (or the matching `pipeline_unigs_flux` / `_sd3` / `_zimage` / `_pixart` file) once the community files are in tree.
 
-No custom CUDA ops, no extra segmentation losses — UNet training is standard latent-diffusion MSE on the 8-channel noise; FLUX training is flow-matching MSE on unpacked image + colormap latents.
+No custom CUDA ops, no extra segmentation losses — UNet training is standard latent-diffusion MSE on the 8-channel noise; FLUX / SD 3.5 / Z-Image training is flow-matching MSE on image + colormap latents; PixArt-α training is epsilon MSE on the same two streams.

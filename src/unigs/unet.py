@@ -37,7 +37,7 @@ from torch import nn
 
 from diffusers import UNet2DConditionModel
 
-from .backbones import INPAINTING_BACKBONES, INPAINTING_UNET_IN_CHANNELS
+from .backbones import UNET_BACKBONES, INPAINTING_UNET_IN_CHANNELS
 
 
 logger = logging.getLogger(__name__)
@@ -48,8 +48,10 @@ LATENT_CHANNELS = 4
 
 _INPAINTING_HINT = (
     "Use an SD inpainting checkpoint such as "
-    f"`{INPAINTING_BACKBONES['sd15']}` or `{INPAINTING_BACKBONES['sd21']}`, "
-    "or the FLUX DiT backbone `--backbone flux` (`black-forest-labs/FLUX.1-Fill-dev`)."
+    f"`{UNET_BACKBONES['sd15']}` or `{UNET_BACKBONES['sd21']}` "
+    "with `UniGSPipeline.from_pretrained`. DiT models use "
+    "`UniGSFluxPipeline.from_pretrained`, `UniGSSD3Pipeline.from_pretrained`, "
+    "`UniGSZImagePipeline.from_pretrained`, or `UniGSPixArtPipeline.from_pretrained`."
 )
 
 

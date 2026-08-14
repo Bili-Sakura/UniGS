@@ -14,9 +14,12 @@
 
 """UniGS inference pipeline on a FLUX.1-Fill-dev DiT backbone.
 
-Conditioning uses **context-token concatenation** (Kontext-style sequence concat
-of packed control + coarse-mask tokens) rather than Fill's channel concat.
-The transformer jointly denoises packed image and colormap tokens.
+Conditioning follows FLUX.1-Fill-dev: packed streams are concatenated on the
+**channel** axis (last dim), not as extra sequence tokens::
+
+    hidden = cat(img_64, cmap_64, control_64, mask_256, dim=-1)  # 448
+
+The transformer jointly denoises packed image + colormap (``[B, S, 128]``).
 """
 
 from __future__ import annotations
@@ -44,12 +47,7 @@ except ImportError:  # pragma: no cover - older Diffusers without FLUX
     FluxTransformer2DModel = None  # type: ignore[misc, assignment]
     FlowMatchEulerDiscreteScheduler = None  # type: ignore[misc, assignment]
 
-from .backbones import (
-    FLUX_FILL_CHECKPOINT,
-    FLUX_LATENT_CHANNELS,
-    UNIGS_DIT_PACKED_IN_CHANNELS,
-    resolve_backbone,
-)
+from .backbones import FLUX_LATENT_CHANNELS
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .pipeline_unigs import (
     PipelineImageInput,
@@ -62,12 +60,13 @@ from .prompts import TASK_PROMPT_TEMPLATES, build_task_prompt
 from .transformer import (
     adapt_unigs_transformer,
     calculate_shift,
-    concat_context_tokens,
+    concat_fill_channels,
     decode_vae_latents,
     encode_vae_latents,
+    pack_fill_mask,
     pack_latents,
-    pack_mask_as_tokens,
-    split_target_tokens,
+    prepare_latent_image_ids,
+    split_packed_pred,
     unpack_latents,
 )
 
@@ -127,8 +126,8 @@ class UniGSFluxPipeline(DiffusionPipeline):
     UniGS on [`FluxTransformer2DModel`] (FLUX.1-Fill-dev).
 
     Packed image and colormap tokens are denoised jointly. The coarse mask and
-    control latent are packed as extra **context tokens** and concatenated on
-    the sequence axis (not the channel axis used by `FluxFillPipeline`).
+    control latent are concatenated on the packed **channel** axis, matching
+    `FluxFillPipeline` (plus a noisy colormap stream).
     """
 
     model_cpu_offload_seq = "text_encoder->text_encoder_2->transformer->vae"
@@ -153,16 +152,6 @@ class UniGSFluxPipeline(DiffusionPipeline):
             raise ImportError(
                 "UniGSFluxPipeline requires Diffusers with FLUX support "
                 "(`FluxTransformer2DModel`). Install `diffusers>=0.32.0`."
-            )
-
-        in_ch = getattr(getattr(transformer, "config", None), "in_channels", None)
-        if in_ch is not None and int(in_ch) != UNIGS_DIT_PACKED_IN_CHANNELS:
-            logger.warning(
-                "UniGS DiT expects transformer.in_channels=%s (token concat), got %s. "
-                "Call `adapt_unigs_transformer(transformer)` or "
-                "`UniGSFluxPipeline.from_fill` before inference.",
-                UNIGS_DIT_PACKED_IN_CHANNELS,
-                in_ch,
             )
 
         self.register_modules(
@@ -198,56 +187,17 @@ class UniGSFluxPipeline(DiffusionPipeline):
         self.pdm = ProgressiveDichotomyModule()
 
     @classmethod
-    def from_fill(
-        cls,
-        pretrained_model_name_or_path: Optional[str] = None,
-        backbone: str = "flux",
-        torch_dtype: Optional[torch.dtype] = None,
-        revision: Optional[str] = None,
-        variant: Optional[str] = None,
-        scheduler=None,
-        **kwargs,
-    ) -> "UniGSFluxPipeline":
-        """Load FLUX.1-Fill-dev and adapt it to UniGS context-token concat."""
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load a UniGS FLUX pipeline or adapt FLUX.1-Fill-dev (Diffusers contract)."""
         if FluxTransformer2DModel is None or FlowMatchEulerDiscreteScheduler is None:
             raise ImportError(
                 "FLUX UniGS requires Diffusers with `FluxTransformer2DModel` "
                 "and `FlowMatchEulerDiscreteScheduler` (diffusers>=0.32.0)."
             )
-        pretrained_model_name_or_path = resolve_backbone(
-            backbone=backbone,
-            pretrained_model_name_or_path=pretrained_model_name_or_path or FLUX_FILL_CHECKPOINT,
-        )
-        load_kw = dict(revision=revision, variant=variant, torch_dtype=torch_dtype)
-        tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer", revision=revision)
-        tokenizer_2 = T5TokenizerFast.from_pretrained(
-            pretrained_model_name_or_path, subfolder="tokenizer_2", revision=revision
-        )
-        text_encoder = CLIPTextModel.from_pretrained(
-            pretrained_model_name_or_path, subfolder="text_encoder", **load_kw
-        )
-        text_encoder_2 = T5EncoderModel.from_pretrained(
-            pretrained_model_name_or_path, subfolder="text_encoder_2", **load_kw
-        )
-        vae = AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae", **load_kw)
-        transformer = FluxTransformer2DModel.from_pretrained(
-            pretrained_model_name_or_path, subfolder="transformer", **load_kw
-        )
-        transformer = adapt_unigs_transformer(transformer)
-        if scheduler is None:
-            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-                pretrained_model_name_or_path, subfolder="scheduler"
-            )
-        return cls(
-            vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            text_encoder_2=text_encoder_2,
-            tokenizer_2=tokenizer_2,
-            transformer=transformer,
-            scheduler=scheduler,
-            **kwargs,
-        )
+        pipeline = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        if getattr(pipeline, "transformer", None) is not None:
+            pipeline.transformer = adapt_unigs_transformer(pipeline.transformer, family="flux")
+        return pipeline
 
     def encode_prompt(
         self,
@@ -303,7 +253,7 @@ class UniGSFluxPipeline(DiffusionPipeline):
         colormap_tokens = pack_latents(colormap, batch_size, self.latent_channels, latent_h, latent_w)
         return image_tokens, colormap_tokens
 
-    def prepare_context_tokens(
+    def prepare_fill_condition(
         self,
         control_image: torch.Tensor,
         coarse_mask: torch.Tensor,
@@ -323,11 +273,10 @@ class UniGSFluxPipeline(DiffusionPipeline):
         control_tokens = pack_latents(
             control_latents, control_latents.shape[0], control_latents.shape[1], latent_h, latent_w
         )
-        mask_tokens = pack_mask_as_tokens(
+        mask_tokens = pack_fill_mask(
             coarse_mask.to(device=device, dtype=dtype),
-            latent_height=latent_h,
-            latent_width=latent_w,
-            latent_channels=self.latent_channels,
+            height=latent_h,
+            width=latent_w,
         )
         if mask_tokens.shape[0] < batch_size:
             mask_tokens = mask_tokens.repeat(batch_size // mask_tokens.shape[0], 1, 1)
@@ -461,7 +410,7 @@ class UniGSFluxPipeline(DiffusionPipeline):
             generator,
             latents,
         )
-        control_tokens, mask_tokens = self.prepare_context_tokens(
+        control_tokens, mask_tokens = self.prepare_fill_condition(
             control_image,
             coarse_mask,
             batch_size * num_images_per_prompt,
@@ -471,8 +420,8 @@ class UniGSFluxPipeline(DiffusionPipeline):
             device,
             generator,
         )
-        packed_h, packed_w = latent_h // 2, latent_w // 2
-        target_latents = torch.cat([image_tokens, colormap_tokens], dim=1)
+        img_ids = prepare_latent_image_ids(latent_h, latent_w, device, dtype)
+        target_latents = torch.cat([image_tokens, colormap_tokens], dim=-1)
 
         if getattr(self.transformer.config, "guidance_embeds", False):
             guidance = torch.full((target_latents.shape[0],), guidance_scale, device=device, dtype=torch.float32)
@@ -482,13 +431,9 @@ class UniGSFluxPipeline(DiffusionPipeline):
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                hidden_states, img_ids, target_seq_len = concat_context_tokens(
-                    target_latents[:, : image_tokens.shape[1]],
-                    target_latents[:, image_tokens.shape[1] :],
-                    control_tokens,
-                    mask_tokens,
-                    packed_h,
-                    packed_w,
+                packed_image, packed_colormap = split_packed_pred(target_latents)
+                hidden_states = concat_fill_channels(
+                    packed_image, packed_colormap, control_tokens, mask_tokens
                 )
                 timestep = t.expand(target_latents.shape[0]).to(target_latents.dtype)
                 noise_pred = self.transformer(
@@ -502,14 +447,13 @@ class UniGSFluxPipeline(DiffusionPipeline):
                     joint_attention_kwargs=joint_attention_kwargs,
                     return_dict=False,
                 )[0]
-                noise_pred = noise_pred[:, :target_seq_len]
                 target_latents = self.scheduler.step(noise_pred, t, target_latents, return_dict=False)[0]
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, target_latents)
 
-        image_pred, colormap_pred = split_target_tokens(target_latents, target_latents.shape[1])
+        image_pred, colormap_pred = split_packed_pred(target_latents)
         image_latents = unpack_latents(image_pred, height, width, self.vae_scale_factor)
         colormap_latents = unpack_latents(colormap_pred, height, width, self.vae_scale_factor)
 
