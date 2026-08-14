@@ -24,7 +24,7 @@ UNet example:
         --learning_rate=5e-5 --max_train_steps=30000 --checkpointing_steps=5000 \\
         --mixed_precision=fp16 --task=joint
 
-FLUX Fill DiT example (context-token concat; LoRA recommended):
+FLUX Fill DiT example (Fill-style channel concat; LoRA recommended):
     accelerate launch src/train_unigs.py \\
         --backbone=flux \\
         --coco_image_dir=/data/coco/train2017 \\
@@ -34,8 +34,8 @@ FLUX Fill DiT example (context-token concat; LoRA recommended):
         --learning_rate=1e-4 --lora_rank=16 --max_train_steps=10000 \\
         --mixed_precision=bf16 --gradient_checkpointing --task=joint
 
-SD 3.5 Medium / Z-Image / PixArt-α are text-to-image DiTs; UniGS still conditions
-with context-token concat (not channel concat):
+SD 3.5 Medium / Z-Image / PixArt-α are text-to-image DiTs; UniGS conditions
+with Fill-style channel concat (same protocol as FLUX.1-Fill-dev):
 
     accelerate launch src/train_unigs.py --backbone=sd3 ... --mixed_precision=bf16
     accelerate launch src/train_unigs.py --backbone=z_image ... --mixed_precision=bf16
@@ -97,19 +97,20 @@ from unigs.dit import (
     encode_pixart_prompt,
     encode_sd3_prompt,
     encode_zimage_prompt,
-    forward_pixart_token_concat,
-    forward_sd3_token_concat,
-    forward_zimage_omni,
+    forward_pixart_channel_concat,
+    forward_sd3_channel_concat,
+    forward_zimage_channel_concat,
     pixart_added_cond_kwargs,
     resize_mask_to_latents,
 )
 from unigs.transformer import (
     adapt_unigs_transformer,
-    concat_context_tokens,
+    concat_fill_channels,
     encode_vae_latents,
+    pack_fill_mask,
     pack_latents,
-    pack_mask_as_tokens,
-    split_target_tokens,
+    prepare_latent_image_ids,
+    split_packed_pred,
     unpack_latents,
 )
 from unigs.unet import adapt_unigs_unet
@@ -145,7 +146,7 @@ def parse_args():
         help=(
             "Hub id or local path. UNet inpainting: "
             f"{INPAINTING_BACKBONES['sd15']} / {INPAINTING_BACKBONES['sd21']}. "
-            "DiT (context-token concat): "
+            "DiT (Fill-style channel concat): "
             f"flux={INPAINTING_BACKBONES['flux']}, "
             f"sd3={INPAINTING_BACKBONES['sd3']}, "
             f"z_image={INPAINTING_BACKBONES['z_image']}, "
@@ -307,10 +308,11 @@ def _apply_dit_lora(transformer, rank: int, alpha: Optional[int] = None):
     transformer.requires_grad_(False)
     if getattr(transformer, "x_embedder", None) is not None:
         transformer.x_embedder.requires_grad_(True)
-    if getattr(transformer, "unigs_stream_embed", None) is not None:
-        transformer.unigs_stream_embed.requires_grad_(True)
     if getattr(transformer, "all_x_embedder", None) is not None:
         transformer.all_x_embedder.requires_grad_(True)
+    final_layer = getattr(transformer, "all_final_layer", None)
+    if final_layer is not None and getattr(final_layer, "linear", None) is not None:
+        final_layer.linear.requires_grad_(True)
     pos_embed = getattr(transformer, "pos_embed", None)
     if pos_embed is not None and getattr(pos_embed, "proj", None) is not None:
         pos_embed.proj.requires_grad_(True)
@@ -502,19 +504,16 @@ def _flux_training_step(
     noisy_colormap = (1.0 - sigmas) * colormap_latents + sigmas * noise_colormap
 
     latent_h, latent_w = image_latents.shape[2], image_latents.shape[3]
-    packed_h, packed_w = latent_h // 2, latent_w // 2
     image_tokens = pack_latents(noisy_image)
     colormap_tokens = pack_latents(noisy_colormap)
     control_tokens = pack_latents(control_latents)
-    mask_tokens = pack_mask_as_tokens(
+    mask_tokens = pack_fill_mask(
         batch["coarse_mask"].to(device=device, dtype=weight_dtype),
-        latent_height=latent_h,
-        latent_width=latent_w,
-        latent_channels=image_latents.shape[1],
+        height=latent_h,
+        width=latent_w,
     )
-    hidden_states, img_ids, target_seq_len = concat_context_tokens(
-        image_tokens, colormap_tokens, control_tokens, mask_tokens, packed_h, packed_w
-    )
+    hidden_states = concat_fill_channels(image_tokens, colormap_tokens, control_tokens, mask_tokens)
+    img_ids = prepare_latent_image_ids(latent_h, latent_w, image_tokens.device, image_tokens.dtype)
 
     if getattr(unwrap_model(accelerator, transformer).config, "guidance_embeds", False):
         guidance = torch.full((bsz,), args.train_guidance_scale, device=device, dtype=torch.float32)
@@ -531,7 +530,7 @@ def _flux_training_step(
         img_ids=img_ids,
         return_dict=False,
     )[0]
-    pred_image_tokens, pred_colormap_tokens = split_target_tokens(model_pred, target_seq_len)
+    pred_image_tokens, pred_colormap_tokens = split_packed_pred(model_pred)
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
     pred_image = unpack_latents(pred_image_tokens, args.resolution, args.resolution, vae_scale_factor)
     pred_colormap = unpack_latents(pred_colormap_tokens, args.resolution, args.resolution, vae_scale_factor)
@@ -636,9 +635,8 @@ def _sd3_training_step(
         batch["coarse_mask"].to(device=device, dtype=weight_dtype),
         latent_height=image_latents.shape[2],
         latent_width=image_latents.shape[3],
-        latent_channels=image_latents.shape[1],
     )
-    model_pred = forward_sd3_token_concat(
+    model_pred = forward_sd3_channel_concat(
         transformer,
         noisy_image,
         noisy_colormap,
@@ -681,10 +679,9 @@ def _zimage_training_step(
         batch["coarse_mask"].to(device=device, dtype=weight_dtype),
         latent_height=image_latents.shape[2],
         latent_width=image_latents.shape[3],
-        latent_channels=image_latents.shape[1],
     )
     timestep = (1000 - timesteps) / 1000
-    model_pred = forward_zimage_omni(
+    model_pred = forward_zimage_channel_concat(
         transformer,
         noisy_image,
         noisy_colormap,
@@ -731,7 +728,6 @@ def _pixart_training_step(
         batch["coarse_mask"].to(device=device, dtype=weight_dtype),
         latent_height=image_latents.shape[2],
         latent_width=image_latents.shape[3],
-        latent_channels=image_latents.shape[1],
     )
     added = pixart_added_cond_kwargs(
         unwrap_model(accelerator, transformer),
@@ -741,7 +737,7 @@ def _pixart_training_step(
         dtype=weight_dtype,
         device=device,
     )
-    model_pred = forward_pixart_token_concat(
+    model_pred = forward_pixart_channel_concat(
         transformer,
         noisy_image,
         noisy_colormap,
@@ -1391,7 +1387,7 @@ def main():
     logger.info("  Backbone = %s", args.pretrained_model_name_or_path)
     logger.info(
         "  Architecture = %s",
-        f"dit-{args.dit_family} (context-token concat)" if args.dit else "unet-channel-concat",
+        f"dit-{args.dit_family} (Fill-style channel concat)" if args.dit else "unet-channel-concat",
     )
     logger.info("  Task = %s", args.task)
 

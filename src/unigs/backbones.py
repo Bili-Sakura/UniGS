@@ -15,9 +15,9 @@
 """Supported UniGS backbones: SD inpainting UNets and DiT families.
 
 UNet backbones must be *inpainting* checkpoints (9-in). DiT backbones may be
-text-to-image or inpainting checkpoints; UniGS never uses channel-concat
-conditioning on DiT. Conditioning is always context-token / sequence concat
-(see ``transformer.py`` / ``dit.py``).
+text-to-image or inpainting checkpoints. **All** UniGS DiTs condition the way
+FLUX.1-Fill-dev does: the coarse mask (and control latent) are concatenated on
+the **channel** axis, never as extra sequence / context tokens.
 """
 
 from __future__ import annotations
@@ -33,9 +33,11 @@ UNET_BACKBONES = {
     "sd21": "stabilityai/stable-diffusion-2-inpainting",
 }
 
-# DiT families. `flux` is an inpainting Fill checkpoint (channel-concat is
-# discarded). SD3.5 / Z-Image / PixArt-α are text-to-image DiTs adapted the
-# same way: native in_channels, condition via extra visual token streams.
+# DiT families. FLUX.1-Fill-dev is an inpainting checkpoint whose native
+# condition is packed channel-concat (`cat(noisy, masked_image, mask)` → 384).
+# UniGS keeps that style and adds a noisy colormap stream. SD3.5 / Z-Image /
+# PixArt-α are text-to-image DiTs adapted the same way: extra input channels
+# for colormap + control + mask, extra output channels for the colormap.
 DIT_BACKBONES = {
     "flux": "black-forest-labs/FLUX.1-Fill-dev",
     "flux_fill": "black-forest-labs/FLUX.1-Fill-dev",
@@ -107,18 +109,16 @@ PIXART_1024_CHECKPOINT = "PixArt-alpha/PixArt-XL-2-1024-MS"
 
 FLUX_LATENT_CHANNELS = 16
 FLUX_FILL_PACKED_IN_CHANNELS = 384  # packed noisy (64) + masked image (64) + mask (256)
-UNIGS_DIT_PACKED_IN_CHANNELS = 64  # packed 16-channel latents only
-UNIGS_DIT_PACKED_OUT_CHANNELS = 64
+FLUX_FILL_PACKED_LATENT = 64  # 16 latent channels × 2×2 pack
+FLUX_FILL_PACKED_MASK = 256  # (vae_scale 8)² × 2×2 pack
+# UniGS Fill layout: noisy image (64) + noisy colormap (64) + control (64) + mask (256).
+UNIGS_DIT_PACKED_IN_CHANNELS = 448
+UNIGS_DIT_PACKED_OUT_CHANNELS = 128  # packed image + colormap
 
 SD3_LATENT_CHANNELS = 16
 ZIMAGE_LATENT_CHANNELS = 16
 PIXART_LATENT_CHANNELS = 4
-
-# RoPE / stream ids for concatenated visual tokens (Kontext-style first axis).
-DIT_STREAM_IMAGE = 0
-DIT_STREAM_COLORMAP = 1
-DIT_STREAM_CONTROL = 2
-DIT_STREAM_MASK = 3
+SPATIAL_MASK_CHANNELS = 1  # latent-resolution mask concatenated on the channel axis
 
 _TRANSFORMER_CLASS_TO_FAMILY = {
     "FluxTransformer2DModel": "flux",
@@ -192,6 +192,57 @@ def is_unet_checkpoint(name_or_path: Optional[str]) -> bool:
     if name_or_path in UNET_BACKBONES or name_or_path in UNET_BACKBONES.values():
         return True
     return not is_dit_checkpoint(name_or_path)
+
+
+DIT_FAMILY_NATIVE_IN_CHANNELS = {
+    "sd3": SD3_LATENT_CHANNELS,
+    "z_image": ZIMAGE_LATENT_CHANNELS,
+    "pixart": PIXART_LATENT_CHANNELS,
+}
+# PixArt-α emits learned sigma (2 × latent channels); SD3 / Z-Image do not.
+DIT_FAMILY_NATIVE_OUT_CHANNELS = {
+    "sd3": SD3_LATENT_CHANNELS,
+    "z_image": ZIMAGE_LATENT_CHANNELS,
+    "pixart": PIXART_LATENT_CHANNELS * 2,
+}
+
+
+def native_in_channels(family: str) -> int:
+    if family not in DIT_FAMILY_NATIVE_IN_CHANNELS:
+        raise ValueError(f"family {family!r} has no spatial native in_channels")
+    return DIT_FAMILY_NATIVE_IN_CHANNELS[family]
+
+
+def native_out_channels(family: str) -> int:
+    if family not in DIT_FAMILY_NATIVE_OUT_CHANNELS:
+        raise ValueError(f"family {family!r} has no spatial native out_channels")
+    return DIT_FAMILY_NATIVE_OUT_CHANNELS[family]
+
+
+def spatial_unigs_in_channels(latent_channels: int, mask_channels: int = SPATIAL_MASK_CHANNELS) -> int:
+    """``[z_image, z_colormap, z_control, mask]`` channel count."""
+    return int(latent_channels) * 3 + int(mask_channels)
+
+
+def spatial_unigs_out_channels(native_out: int) -> int:
+    """Dual-stream (image + colormap) output channels."""
+    return int(native_out) * 2
+
+
+def infer_transformer_family(transformer) -> Optional[str]:
+    family = getattr(getattr(transformer, "config", None), "unigs_dit_family", None)
+    if family in DIT_FAMILY_CHECKPOINTS:
+        return family
+    return _TRANSFORMER_CLASS_TO_FAMILY.get(getattr(transformer, "__class__", type(transformer)).__name__)
+
+
+def family_from_pretrained(name_or_path: Optional[str] = None, transformer=None) -> Optional[str]:
+    family = detect_dit_family_from_path(name_or_path) or resolve_dit_family(name_or_path)
+    if family:
+        return family
+    if transformer is not None:
+        return infer_transformer_family(transformer)
+    return None
 
 
 def dit_uses_flow_matching(family: Optional[str]) -> bool:

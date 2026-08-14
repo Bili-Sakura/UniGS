@@ -41,7 +41,7 @@ from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .dataset import UniGSInstanceDataset, collate_fn
 from .pipeline_unigs import UniGSPipeline, UniGSPipelineOutput
 from .prompts import TASK_PROMPT_TEMPLATES, build_task_prompt
-from .transformer import adapt_unigs_transformer, concat_context_tokens, pack_latents
+from .transformer import adapt_unigs_transformer, concat_fill_channels, pack_latents
 from .unet import UNIGS_IN_CHANNELS, UNIGS_OUT_CHANNELS, adapt_unigs_unet
 
 try:
@@ -80,7 +80,7 @@ __all__ = [
     "adapt_unigs_unet",
     "build_task_prompt",
     "collate_fn",
-    "concat_context_tokens",
+    "concat_fill_channels",
     "encode_flux_prompt",
     "is_dit_checkpoint",
     "pack_latents",
