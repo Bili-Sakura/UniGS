@@ -16,7 +16,10 @@
 
 The UNet denoises concatenated image+colormap latents conditioned on a coarse
 mask, a control latent, and a task-prefixed CLIP prompt — the same protocol as
-training (arxiv:2312.01985). Backbone is Stable Diffusion 1.5 or 2.1.
+training (arxiv:2312.01985). Backbone is Stable Diffusion 1.5 or 2.1 inpainting.
+
+For the FLUX.1-Fill-dev DiT backbone (context-token concat instead of channel
+concat), see [`UniGSFluxPipeline`].
 """
 
 from __future__ import annotations
@@ -52,7 +55,7 @@ try:
 except ImportError:
     KarrasDiffusionSchedulers = object
 
-from .backbones import INPAINTING_BACKBONES, resolve_inpainting_checkpoint
+from .backbones import INPAINTING_BACKBONES, is_dit_checkpoint, resolve_inpainting_checkpoint
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .prompts import TASK_PROMPT_TEMPLATES, build_task_prompt
 from .unet import UNIGS_IN_CHANNELS, UNIGS_OUT_CHANNELS, adapt_unigs_unet
@@ -91,10 +94,17 @@ def retrieve_timesteps(
     num_inference_steps: Optional[int] = None,
     device: Optional[Union[str, torch.device]] = None,
     timesteps: Optional[List[int]] = None,
+    sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
+    if timesteps is not None and sigmas is not None:
+        raise ValueError("Only one of `timesteps` or `sigmas` can be passed.")
     if timesteps is not None:
         scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    elif sigmas is not None:
+        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     else:
@@ -261,13 +271,26 @@ class UniGSPipeline(DiffusionPipeline, StableDiffusionMixin):
                 Hub id or local path to an SD *inpainting* pipeline. When omitted,
                 `backbone` selects the default checkpoint (`sd15` or `sd21`).
             backbone:
-                Shorthand for `stable-diffusion-v1-5/stable-diffusion-inpainting`
-                (`sd15`) or `stabilityai/stable-diffusion-2-inpainting` (`sd21`).
+                Shorthand for SD 1.5 / 2.1 inpainting (`sd15`, `sd21`) or
+                FLUX.1-Fill-dev (`flux` / `flux_fill`). DiT checkpoints are
+                dispatched to [`UniGSFluxPipeline`].
         """
         pretrained_model_name_or_path = resolve_inpainting_checkpoint(
             backbone=backbone,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
         )
+        if is_dit_checkpoint(backbone) or is_dit_checkpoint(pretrained_model_name_or_path):
+            from .pipeline_unigs_flux import UniGSFluxPipeline
+
+            return UniGSFluxPipeline.from_fill(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                backbone=backbone,
+                torch_dtype=torch_dtype,
+                revision=revision,
+                variant=variant,
+                scheduler=scheduler,
+                **kwargs,
+            )
         tokenizer = CLIPTokenizer.from_pretrained(
             pretrained_model_name_or_path, subfolder="tokenizer", revision=revision
         )

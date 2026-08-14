@@ -1,6 +1,6 @@
 accelerate>=0.27.0
-diffusers>=0.27.0
-transformers>=4.36.0
+diffusers>=0.32.0
+transformers>=4.44.0
 datasets>=2.16.0
 huggingface_hub>=0.20.0
 safetensors
@@ -9,3 +9,6 @@ torchvision
 Pillow
 numpy
 tqdm
+sentencepiece
+protobuf
+peft

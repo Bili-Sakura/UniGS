@@ -23,9 +23,15 @@ Paper: https://arxiv.org/abs/2312.01985
 """
 
 from .backbones import (
+    BACKBONES,
     DEFAULT_BACKBONE,
+    DIT_BACKBONES,
+    FLUX_FILL_CHECKPOINT,
     INPAINTING_BACKBONES,
     INPAINTING_UNET_IN_CHANNELS,
+    UNET_BACKBONES,
+    is_dit_checkpoint,
+    resolve_backbone,
     resolve_inpainting_checkpoint,
 )
 from .coarse_mask import CoarseMaskGenerator
@@ -33,23 +39,42 @@ from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .dataset import UniGSInstanceDataset, collate_fn
 from .pipeline_unigs import UniGSPipeline, UniGSPipelineOutput
 from .prompts import TASK_PROMPT_TEMPLATES, build_task_prompt
+from .transformer import adapt_unigs_transformer, concat_context_tokens, pack_latents
 from .unet import UNIGS_IN_CHANNELS, UNIGS_OUT_CHANNELS, adapt_unigs_unet
 
+try:
+    from .pipeline_unigs_flux import UniGSFluxPipeline, encode_flux_prompt
+except ImportError:  # Diffusers without FLUX
+    UniGSFluxPipeline = None  # type: ignore[misc, assignment]
+    encode_flux_prompt = None  # type: ignore[misc, assignment]
+
+
 __all__ = [
+    "BACKBONES",
     "CoarseMaskGenerator",
     "DEFAULT_BACKBONE",
+    "DIT_BACKBONES",
+    "FLUX_FILL_CHECKPOINT",
     "INPAINTING_BACKBONES",
     "INPAINTING_UNET_IN_CHANNELS",
     "LocationAwarePalette",
     "ProgressiveDichotomyModule",
+    "UNET_BACKBONES",
+    "UniGSFluxPipeline",
     "UniGSInstanceDataset",
     "UniGSPipeline",
     "UniGSPipelineOutput",
     "TASK_PROMPT_TEMPLATES",
     "UNIGS_IN_CHANNELS",
     "UNIGS_OUT_CHANNELS",
+    "adapt_unigs_transformer",
     "adapt_unigs_unet",
     "build_task_prompt",
     "collate_fn",
+    "concat_context_tokens",
+    "encode_flux_prompt",
+    "is_dit_checkpoint",
+    "pack_latents",
+    "resolve_backbone",
     "resolve_inpainting_checkpoint",
 ]
