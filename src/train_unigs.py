@@ -35,7 +35,7 @@ FLUX Fill DiT example (Fill-style channel concat; LoRA recommended):
         --mixed_precision=bf16 --gradient_checkpointing --task=joint
 
 SD 3.5 Medium / Z-Image / PixArt-α are text-to-image DiTs; UniGS conditions
-with Fill-style channel concat (same protocol as FLUX.1-Fill-dev):
+those with context-token concat (not channel concat):
 
     accelerate launch src/train_unigs.py --backbone=sd3 ... --mixed_precision=bf16
     accelerate launch src/train_unigs.py --backbone=z_image ... --mixed_precision=bf16
@@ -97,9 +97,9 @@ from unigs.dit import (
     encode_pixart_prompt,
     encode_sd3_prompt,
     encode_zimage_prompt,
-    forward_pixart_channel_concat,
-    forward_sd3_channel_concat,
-    forward_zimage_channel_concat,
+    forward_pixart_token_concat,
+    forward_sd3_token_concat,
+    forward_zimage_omni,
     pixart_added_cond_kwargs,
     resize_mask_to_latents,
 )
@@ -146,7 +146,8 @@ def parse_args():
         help=(
             "Hub id or local path. UNet inpainting: "
             f"{INPAINTING_BACKBONES['sd15']} / {INPAINTING_BACKBONES['sd21']}. "
-            "DiT (Fill-style channel concat): "
+            "DiT: FLUX uses Fill-style channel concat; sd3 / z_image / pixart use "
+            "context-token concat. "
             f"flux={INPAINTING_BACKBONES['flux']}, "
             f"sd3={INPAINTING_BACKBONES['sd3']}, "
             f"z_image={INPAINTING_BACKBONES['z_image']}, "
@@ -308,11 +309,10 @@ def _apply_dit_lora(transformer, rank: int, alpha: Optional[int] = None):
     transformer.requires_grad_(False)
     if getattr(transformer, "x_embedder", None) is not None:
         transformer.x_embedder.requires_grad_(True)
+    if getattr(transformer, "unigs_stream_embed", None) is not None:
+        transformer.unigs_stream_embed.requires_grad_(True)
     if getattr(transformer, "all_x_embedder", None) is not None:
         transformer.all_x_embedder.requires_grad_(True)
-    final_layer = getattr(transformer, "all_final_layer", None)
-    if final_layer is not None and getattr(final_layer, "linear", None) is not None:
-        final_layer.linear.requires_grad_(True)
     pos_embed = getattr(transformer, "pos_embed", None)
     if pos_embed is not None and getattr(pos_embed, "proj", None) is not None:
         pos_embed.proj.requires_grad_(True)
@@ -635,8 +635,9 @@ def _sd3_training_step(
         batch["coarse_mask"].to(device=device, dtype=weight_dtype),
         latent_height=image_latents.shape[2],
         latent_width=image_latents.shape[3],
+        latent_channels=image_latents.shape[1],
     )
-    model_pred = forward_sd3_channel_concat(
+    model_pred = forward_sd3_token_concat(
         transformer,
         noisy_image,
         noisy_colormap,
@@ -679,9 +680,10 @@ def _zimage_training_step(
         batch["coarse_mask"].to(device=device, dtype=weight_dtype),
         latent_height=image_latents.shape[2],
         latent_width=image_latents.shape[3],
+        latent_channels=image_latents.shape[1],
     )
     timestep = (1000 - timesteps) / 1000
-    model_pred = forward_zimage_channel_concat(
+    model_pred = forward_zimage_omni(
         transformer,
         noisy_image,
         noisy_colormap,
@@ -728,6 +730,7 @@ def _pixart_training_step(
         batch["coarse_mask"].to(device=device, dtype=weight_dtype),
         latent_height=image_latents.shape[2],
         latent_width=image_latents.shape[3],
+        latent_channels=image_latents.shape[1],
     )
     added = pixart_added_cond_kwargs(
         unwrap_model(accelerator, transformer),
@@ -737,7 +740,7 @@ def _pixart_training_step(
         dtype=weight_dtype,
         device=device,
     )
-    model_pred = forward_pixart_channel_concat(
+    model_pred = forward_pixart_token_concat(
         transformer,
         noisy_image,
         noisy_colormap,
@@ -1387,7 +1390,13 @@ def main():
     logger.info("  Backbone = %s", args.pretrained_model_name_or_path)
     logger.info(
         "  Architecture = %s",
-        f"dit-{args.dit_family} (Fill-style channel concat)" if args.dit else "unet-channel-concat",
+        (
+            f"dit-{args.dit_family} (Fill-style channel concat)"
+            if args.dit_family == "flux"
+            else f"dit-{args.dit_family} (context-token concat)"
+            if args.dit
+            else "unet-channel-concat"
+        ),
     )
     logger.info("  Task = %s", args.task)
 

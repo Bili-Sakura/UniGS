@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for FLUX DiT packing and UniGS Fill-style channel concat."""
+"""Tests for FLUX Fill channel concat and spatial DiT context-token concat."""
 
 from __future__ import annotations
 
@@ -34,6 +34,10 @@ _pkg.__path__ = [os.path.join(os.path.dirname(__file__), "..", "src", "unigs")]
 sys.modules.setdefault("unigs", _pkg)
 
 from unigs.backbones import (
+    DIT_STREAM_COLORMAP,
+    DIT_STREAM_CONTROL,
+    DIT_STREAM_IMAGE,
+    DIT_STREAM_MASK,
     FLUX_FILL_PACKED_IN_CHANNELS,
     FLUX_FILL_PACKED_LATENT,
     FLUX_FILL_PACKED_MASK,
@@ -44,13 +48,14 @@ from unigs.backbones import (
     is_dit_checkpoint,
     resolve_backbone,
     resolve_dit_family,
-    spatial_unigs_in_channels,
-    spatial_unigs_out_channels,
 )
 from unigs.dit import (
-    concat_spatial_unigs,
+    ensure_unigs_stream_embed,
     maybe_drop_learned_sigma,
+    prepare_zimage_omni_inputs,
     resize_mask_to_latents,
+    split_zimage_omni_output,
+    unpatchify_stream_tokens,
 )
 from unigs.transformer import (
     adapt_unigs_transformer,
@@ -95,53 +100,6 @@ class DummyTransformer(nn.Module):
             setattr(self.config, key, value)
 
 
-class DummyPatchEmbed(nn.Module):
-    def __init__(self, in_channels, inner_dim, patch_size=2):
-        super().__init__()
-        self.proj = nn.Conv2d(in_channels, inner_dim, kernel_size=patch_size, stride=patch_size)
-
-
-class DummySpatialTransformer(nn.Module):
-    def __init__(self, in_channels=16, out_channels=16, inner_dim=32, patch_size=2):
-        super().__init__()
-        self.config = DummyConfig(in_channels, out_channels, patch_size=patch_size)
-        self.pos_embed = DummyPatchEmbed(in_channels, inner_dim, patch_size)
-        self.proj_out = nn.Linear(inner_dim, out_channels)
-        with torch.no_grad():
-            self.pos_embed.proj.weight.fill_(1.0)
-            if self.pos_embed.proj.bias is not None:
-                self.pos_embed.proj.bias.fill_(0.5)
-            self.proj_out.weight.fill_(0.1)
-
-    def register_to_config(self, **kwargs):
-        for key, value in kwargs.items():
-            setattr(self.config, key, value)
-
-
-class DummyFinalLayer(nn.Module):
-    def __init__(self, inner_dim, out_features):
-        super().__init__()
-        self.linear = nn.Linear(inner_dim, out_features)
-
-
-class DummyZImageTransformer(nn.Module):
-    def __init__(self, in_channels=16, out_channels=16, inner_dim=32, patch_size=2):
-        super().__init__()
-        self.config = DummyConfig(in_channels, out_channels, patch_size=patch_size)
-        patch_vol = patch_size * patch_size
-        self.all_x_embedder = nn.Linear(in_channels * patch_vol, inner_dim)
-        self.all_final_layer = DummyFinalLayer(inner_dim, out_channels * patch_vol)
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        with torch.no_grad():
-            self.all_x_embedder.weight.fill_(1.0)
-            self.all_final_layer.linear.weight.fill_(0.1)
-
-    def register_to_config(self, **kwargs):
-        for key, value in kwargs.items():
-            setattr(self.config, key, value)
-
-
 class BackboneTests(unittest.TestCase):
     def test_flux_shorthand_resolves_to_fill_dev(self):
         self.assertEqual(resolve_backbone("flux"), "black-forest-labs/FLUX.1-Fill-dev")
@@ -178,13 +136,9 @@ class BackboneTests(unittest.TestCase):
         self.assertEqual(default_dit_guidance("z_image"), 0.0)
         self.assertEqual(default_dit_guidance("pixart"), 4.5)
         self.assertEqual(default_dit_guidance("flux"), 30.0)
-        self.assertEqual(spatial_unigs_in_channels(16), 49)
-        self.assertEqual(spatial_unigs_in_channels(4), 13)
-        self.assertEqual(spatial_unigs_out_channels(16), 32)
-        self.assertEqual(spatial_unigs_out_channels(8), 16)
 
 
-class PackingTests(unittest.TestCase):
+class FluxChannelConcatTests(unittest.TestCase):
     def test_pack_unpack_roundtrip(self):
         latents = torch.arange(2 * 16 * 8 * 8, dtype=torch.float32).reshape(2, 16, 8, 8)
         packed = pack_latents(latents)
@@ -221,8 +175,6 @@ class PackingTests(unittest.TestCase):
         self.assertEqual(tuple(ids.shape), (16, 3))
         self.assertTrue(torch.equal(ids[:, 0], torch.zeros(16)))
 
-
-class AdapterTests(unittest.TestCase):
     def test_fill_embedder_remaps_masked_image_to_control(self):
         transformer = DummyTransformer()
         old_in = transformer.x_embedder.weight.clone()
@@ -249,26 +201,23 @@ class AdapterTests(unittest.TestCase):
         self.assertIs(adapt_unigs_transformer(transformer).x_embedder, embedder)
 
 
-class SpatialDiTTests(unittest.TestCase):
-    def test_spatial_channel_concat_is_3c_plus_mask(self):
-        image = torch.zeros(2, 16, 8, 8)
-        colormap = torch.ones(2, 16, 8, 8)
-        control = torch.full((2, 16, 8, 8), 2.0)
-        mask = torch.ones(2, 1, 64, 64)
-        hidden = concat_spatial_unigs(image, colormap, control, mask)
-        self.assertEqual(tuple(hidden.shape), (2, 49, 8, 8))
-        self.assertTrue(torch.equal(hidden[:, :16], image))
-        self.assertTrue(torch.equal(hidden[:, 16:32], colormap))
-        self.assertTrue(torch.equal(hidden[:, 32:48], control))
-        self.assertTrue(torch.allclose(hidden[:, 48:49], torch.ones(2, 1, 8, 8)))
+class SpatialTokenConcatTests(unittest.TestCase):
+    def test_unpatchify_stream_prefix_drops_context(self):
+        batch, patch, channels, height, width = 2, 2, 16, 8, 8
+        seq = (height // patch) * (width // patch)
+        hidden = torch.arange(batch * 4 * seq * patch * patch * channels, dtype=torch.float32).reshape(
+            batch, 4 * seq, patch * patch * channels
+        )
+        image, colormap = unpatchify_stream_tokens(hidden, height, width, patch, channels, num_streams=2)
+        self.assertEqual(tuple(image.shape), (batch, channels, height, width))
+        self.assertEqual(tuple(colormap.shape), (batch, channels, height, width))
+        self.assertFalse(torch.equal(image, colormap))
 
-    def test_mask_resized_to_one_channel(self):
+    def test_mask_resized_not_channel_concat(self):
         mask = torch.ones(2, 1, 64, 64)
-        latents = resize_mask_to_latents(mask, 8, 8)
-        self.assertEqual(tuple(latents.shape), (2, 1, 8, 8))
+        latents = resize_mask_to_latents(mask, 8, 8, 16)
+        self.assertEqual(tuple(latents.shape), (2, 16, 8, 8))
         self.assertTrue(torch.allclose(latents, torch.ones_like(latents)))
-        expanded = resize_mask_to_latents(mask, 8, 8, 16)
-        self.assertEqual(tuple(expanded.shape), (2, 16, 8, 8))
 
     def test_learned_sigma_is_dropped(self):
         sample = torch.randn(2, 8, 8, 8)
@@ -276,44 +225,53 @@ class SpatialDiTTests(unittest.TestCase):
         self.assertEqual(tuple(kept.shape), (2, 4, 8, 8))
         self.assertTrue(torch.equal(kept, sample[:, :4]))
 
-    def test_sd3_adapter_expands_patch_embed_channels(self):
-        transformer = DummySpatialTransformer(in_channels=16, out_channels=16)
-        old_proj = transformer.pos_embed.proj.weight.clone()
+    def test_sd3_stream_embed_is_zero_init(self):
+        transformer = nn.Module()
+        transformer.config = DummyConfig(
+            in_channels=16, out_channels=16, patch_size=2, num_attention_heads=4, attention_head_dim=8
+        )
+        transformer.inner_dim = 32
+        transformer.register_parameter("_dummy", nn.Parameter(torch.zeros(1)))
+
+        def register_to_config(**kwargs):
+            for key, value in kwargs.items():
+                setattr(transformer.config, key, value)
+
+        transformer.register_to_config = register_to_config
         adapted = adapt_unigs_transformer(transformer, family="sd3")
-        self.assertEqual(adapted.config.in_channels, 49)
-        self.assertEqual(adapted.config.out_channels, 32)
         self.assertEqual(adapted.config.unigs_dit_family, "sd3")
-        self.assertEqual(adapted.pos_embed.proj.in_channels, 49)
-        self.assertEqual(adapted.proj_out.out_features, 32)
-        self.assertTrue(torch.equal(adapted.pos_embed.proj.weight[:, :16], old_proj))
-        self.assertTrue(torch.equal(adapted.pos_embed.proj.weight[:, 16:32], torch.zeros_like(old_proj)))
-        self.assertTrue(torch.equal(adapted.pos_embed.proj.weight[:, 32:48], old_proj))
-        self.assertFalse(hasattr(adapted, "unigs_stream_embed"))
-        self.assertIs(adapt_unigs_transformer(adapted, family="sd3").pos_embed.proj, adapted.pos_embed.proj)
+        self.assertEqual(adapted.config.in_channels, 16)
+        self.assertEqual(tuple(adapted.unigs_stream_embed.shape), (4, 1, 32))
+        self.assertTrue(torch.equal(adapted.unigs_stream_embed, torch.zeros_like(adapted.unigs_stream_embed)))
+        ensure_unigs_stream_embed(adapted)
+        self.assertIs(adapted.unigs_stream_embed, transformer.unigs_stream_embed)
 
-    def test_pixart_adapter_expands_to_13_in_16_out(self):
-        transformer = DummySpatialTransformer(in_channels=4, out_channels=8)
-        adapted = adapt_unigs_transformer(transformer, family="pixart")
-        self.assertEqual(adapted.config.in_channels, 13)
-        self.assertEqual(adapted.config.out_channels, 16)
-        self.assertEqual(adapted.pos_embed.proj.in_channels, 13)
-        self.assertEqual(adapted.proj_out.out_features, 16)
+    def test_zimage_omni_stacks_targets_and_keeps_context_clean(self):
+        image = torch.zeros(2, 16, 8, 8)
+        colormap = torch.ones(2, 16, 8, 8)
+        control = torch.full((2, 16, 8, 8), 2.0)
+        mask = torch.full((2, 16, 8, 8), 3.0)
+        prompts = [torch.randn(5, 12), torch.randn(7, 12)]
+        x, cap, noise_mask, latent_h = prepare_zimage_omni_inputs(image, colormap, control, mask, prompts)
+        self.assertEqual(latent_h, 8)
+        self.assertEqual(len(x), 2)
+        self.assertEqual(len(x[0]), 3)
+        self.assertEqual(tuple(x[0][0].shape), (16, 1, 8, 8))
+        self.assertEqual(tuple(x[0][2].shape), (16, 1, 16, 8))
+        self.assertEqual(noise_mask[0], [0, 0, 1])
+        self.assertEqual(len(cap[0]), 3)
+        fake_out = [torch.cat([image[i], colormap[i]], dim=-2).unsqueeze(1) for i in range(2)]
+        split = split_zimage_omni_output(fake_out, latent_h, negate=True)
+        self.assertEqual(tuple(split.shape), (2, 32, 8, 8))
+        restored_image, restored_cmap = split.chunk(2, dim=1)
+        self.assertTrue(torch.equal(restored_image, -image))
+        self.assertTrue(torch.equal(restored_cmap, -colormap))
 
-    def test_zimage_adapter_is_channel_concat_not_omni(self):
-        transformer = DummyZImageTransformer()
-        old_x = transformer.all_x_embedder.weight.clone()
-        adapted = adapt_unigs_transformer(transformer, family="z_image")
-        self.assertEqual(adapted.config.in_channels, 49)
-        self.assertEqual(adapted.config.out_channels, 32)
-        self.assertEqual(adapted.all_x_embedder.in_features, 49 * 4)
-        self.assertEqual(adapted.all_final_layer.linear.out_features, 32 * 4)
-        self.assertFalse(hasattr(adapted, "unigs_stream_embed"))
-        src_w = old_x.view(old_x.shape[0], 16, 4)
-        dst_w = adapted.all_x_embedder.weight.view(adapted.all_x_embedder.weight.shape[0], 49, 4)
-        self.assertTrue(torch.equal(dst_w[:, :16], src_w))
-        self.assertTrue(torch.equal(dst_w[:, 16:32], torch.zeros_like(src_w)))
-        self.assertTrue(torch.equal(dst_w[:, 32:48], src_w))
-        self.assertTrue(torch.equal(dst_w[:, 48:49], torch.zeros(old_x.shape[0], 1, 4)))
+    def test_stream_ids_are_distinct(self):
+        self.assertEqual(
+            (DIT_STREAM_IMAGE, DIT_STREAM_COLORMAP, DIT_STREAM_CONTROL, DIT_STREAM_MASK),
+            (0, 1, 2, 3),
+        )
 
 
 if __name__ == "__main__":

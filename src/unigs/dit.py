@@ -12,23 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spatial DiT UniGS adapters: Fill-style **channel** concat on 4D maps.
+"""Family-specific DiT forwards for UniGS **context-token** concatenation.
 
-FLUX packs tokens then concatenates on the last dim (see :mod:`unigs.transformer`).
-SD 3.5, PixArt-α, and Z-Image stay in ``[B, C, H, W]`` and concatenate on
-``dim=1`` the same way Fill concatenates on packed channels::
+FLUX.1-Fill-dev is the exception: it stays on Fill-style **channel** concat in
+:mod:`unigs.transformer`. This module covers spatial DiTs:
 
-    hidden = cat(z_image, z_colormap, z_control, mask_1ch, dim=1)  # 3C+1
-    pred   = transformer(hidden, ...)  # native 4D forward, no token concat
-    pred_image, pred_cmap = split along channels  (2 × native out)
+* **SD 3.5** (``SD3Transformer2DModel``) — patch-embed each UniGS stream at its
+  native HxW, add a zero-init stream embedding, concat on the sequence axis,
+  unpatchify only the image + colormap prefix. Spatial stacking is impossible:
+  ``pos_embed_max_size=96`` cannot hold 4×64.
+* **PixArt-α** (``PixArtTransformer2DModel``) — same pos-embed-then-concat
+  pattern. Output may include learned sigma (``out_channels=8``); only the
+  first half is the epsilon / velocity used by the scheduler.
+* **Z-Image** (``ZImageTransformer2DModel``) — native omni mode already accepts
+  a nested list of images plus ``image_noise_mask``. Control + coarse mask are
+  clean context streams; image and colormap are stacked on height as the single
+  noisy target (omni unpatchify returns only the last stream).
 
-The native transformer is used as-is after expanding PatchEmbed / ``x_embedder``
-and the final projection. No extra stream embeddings, no sequence concat, no
-omni nested lists.
+None of these paths channel-concat the condition into ``in_channels``.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -36,218 +42,147 @@ import torch.nn.functional as F
 from torch import nn
 
 from .backbones import (
-    SPATIAL_MASK_CHANNELS,
-    native_in_channels,
-    native_out_channels,
-    spatial_unigs_in_channels,
-    spatial_unigs_out_channels,
+    DIT_STREAM_COLORMAP,
+    DIT_STREAM_CONTROL,
+    DIT_STREAM_IMAGE,
+    DIT_STREAM_MASK,
 )
 
+
+logger = logging.getLogger(__name__)
 
 PromptBatch = Union[str, List[str]]
 
 
-def concat_spatial_unigs(
-    latents: torch.Tensor,
-    colormap_latents: torch.Tensor,
-    control_latents: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    """``[B, 3C+1, H, W]`` channel concat (Fill-style, spatial analog)."""
-    if mask.ndim == 3:
-        mask = mask.unsqueeze(1)
-    if mask.shape[-2:] != latents.shape[-2:]:
-        mask = F.interpolate(mask.float(), size=latents.shape[-2:], mode="nearest").to(dtype=latents.dtype)
-    if mask.shape[1] != SPATIAL_MASK_CHANNELS:
-        mask = mask[:, :SPATIAL_MASK_CHANNELS]
-    return torch.cat([latents, colormap_latents, control_latents, mask], dim=1)
+def transformer_inner_dim(transformer) -> int:
+    inner = getattr(transformer, "inner_dim", None)
+    if inner is not None:
+        return int(inner)
+    config = transformer.config
+    return int(config.num_attention_heads) * int(config.attention_head_dim)
 
 
-def split_dual_output(pred: torch.Tensor, native_out: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split ``[B, 2*native_out, H, W]`` into image and colormap halves."""
-    if pred.shape[1] != 2 * native_out:
-        raise ValueError(f"expected {2 * native_out} output channels, got {pred.shape[1]}")
-    return pred[:, :native_out], pred[:, native_out:]
+def transformer_patch_size(transformer) -> int:
+    return int(getattr(transformer.config, "patch_size", 2) or 2)
 
 
-def maybe_drop_learned_sigma(sample: torch.Tensor, latent_channels: int) -> torch.Tensor:
-    """PixArt learned-sigma: keep the first ``latent_channels`` of an 8-ch half."""
-    if sample.shape[1] == latent_channels:
-        return sample
-    if sample.shape[1] == 2 * latent_channels:
-        return sample.chunk(2, dim=1)[0]
-    return sample
+def transformer_out_channels(transformer) -> int:
+    config = transformer.config
+    out = getattr(config, "out_channels", None)
+    if out is None:
+        out = getattr(transformer, "out_channels", None)
+    if out is None:
+        out = getattr(config, "in_channels", 16)
+    return int(out)
+
+
+def infer_transformer_family(transformer) -> Optional[str]:
+    family = getattr(getattr(transformer, "config", None), "unigs_dit_family", None)
+    if family:
+        return family
+    name = transformer.__class__.__name__
+    return {
+        "FluxTransformer2DModel": "flux",
+        "SD3Transformer2DModel": "sd3",
+        "ZImageTransformer2DModel": "z_image",
+        "PixArtTransformer2DModel": "pixart",
+    }.get(name)
+
+
+def ensure_unigs_stream_embed(transformer, num_streams: int = 4) -> nn.Parameter:
+    """Zero-init per-stream bias so stream 0 matches the pretrained image path."""
+    existing = getattr(transformer, "unigs_stream_embed", None)
+    if isinstance(existing, nn.Parameter) and existing.shape[0] >= num_streams:
+        return existing
+    inner_dim = transformer_inner_dim(transformer)
+    param = next(transformer.parameters())
+    embed = nn.Parameter(torch.zeros(num_streams, 1, inner_dim, device=param.device, dtype=param.dtype))
+    transformer.register_parameter("unigs_stream_embed", embed)
+    return embed
 
 
 def resize_mask_to_latents(
     mask: torch.Tensor,
     latent_height: int,
     latent_width: int,
-    latent_channels: int = SPATIAL_MASK_CHANNELS,
+    latent_channels: int,
 ) -> torch.Tensor:
-    """Nearest-resize a coarse mask to the latent grid.
-
-    UniGS spatial DiTs concat a **1-channel** mask (Fill-style). ``latent_channels``
-    other than 1 repeats the mask (kept for tests / debugging).
-    """
+    """Nearest-resize a coarse mask and repeat it across latent channels."""
     if mask.ndim == 3:
         mask = mask.unsqueeze(1)
     mask = F.interpolate(mask.float(), size=(latent_height, latent_width), mode="nearest")
-    if latent_channels <= 1:
-        return mask[:, :1].to(dtype=mask.dtype)
     return mask.expand(-1, latent_channels, -1, -1).to(dtype=mask.dtype)
 
 
-def _copy_conv2d_unigs_in(src: nn.Conv2d, dst: nn.Conv2d, native_c: int) -> None:
-    """Copy image (+ control) PatchEmbed channels; colormap and mask stay zero.
+def unpatchify_stream_tokens(
+    hidden_states: torch.Tensor,
+    height: int,
+    width: int,
+    patch_size: int,
+    out_channels: int,
+    num_streams: int = 2,
+) -> List[torch.Tensor]:
+    """Unpatchify the leading ``num_streams`` token groups back to ``[B, C, H, W]``.
 
-    ``dst`` is ``3C+1`` in. Image occupies ``0:C``; control occupies ``2C:3C``
-    (Fill's masked-image → UniGS control).
+    ``hidden_states`` is ``[B, N, patch_size**2 * out_channels]`` after ``proj_out``.
+    Context tokens beyond the image + colormap prefix are dropped.
     """
-    with torch.no_grad():
-        dst.weight.zero_()
-        src_in = src.weight.shape[1]
-        dst_in = dst.weight.shape[1]
-        if src_in == native_c and dst_in == spatial_unigs_in_channels(native_c):
-            dst.weight[:, :native_c] = src.weight
-            dst.weight[:, 2 * native_c : 3 * native_c] = src.weight
-        else:
-            n_in = min(src_in, dst_in)
-            dst.weight[:, :n_in] = src.weight[:, :n_in]
-        if src.bias is not None and dst.bias is not None:
-            dst.bias.copy_(src.bias)
+    if hidden_states.ndim != 3:
+        raise ValueError(f"Expected packed tokens `[B, N, D]`, got {tuple(hidden_states.shape)}")
+    patch_h = height // patch_size
+    patch_w = width // patch_size
+    seq = patch_h * patch_w
+    target_len = num_streams * seq
+    if hidden_states.shape[1] < target_len:
+        raise ValueError(
+            f"Token length {hidden_states.shape[1]} is shorter than {num_streams} streams of {seq} patches."
+        )
+    streams = []
+    for index in range(num_streams):
+        tokens = hidden_states[:, index * seq : (index + 1) * seq]
+        tokens = tokens.reshape(
+            hidden_states.shape[0], patch_h, patch_w, patch_size, patch_size, out_channels
+        )
+        tokens = torch.einsum("nhwpqc->nchpwq", tokens)
+        streams.append(tokens.reshape(hidden_states.shape[0], out_channels, height, width))
+    return streams
 
 
-def _copy_linear_out(src: nn.Linear, dst: nn.Linear) -> None:
-    with torch.no_grad():
-        dst.weight.zero_()
-        n_out = min(src.weight.shape[0], dst.weight.shape[0])
-        dst.weight[:n_out] = src.weight[:n_out]
-        if src.bias is not None and dst.bias is not None:
-            dst.bias.zero_()
-            dst.bias[:n_out] = src.bias[:n_out]
+def maybe_drop_learned_sigma(sample: torch.Tensor, latent_channels: int) -> torch.Tensor:
+    if sample.shape[1] == latent_channels * 2:
+        return sample.chunk(2, dim=1)[0]
+    return sample
 
 
-def _copy_linear_in_spatial(src: nn.Linear, dst: nn.Linear, native_c: int) -> None:
-    """Copy pretrained patch-linear columns for image (+ control) channel slots.
-
-    PatchEmbed flattens each patch as ``(C, ph, pw)`` then Linear. UniGS input
-    is ``(3C+1, ph, pw)``. Image occupies the first ``C`` of each spatial cell;
-    control occupies the next ``C`` after colormap; mask is last and stays 0.
-    """
-    with torch.no_grad():
-        dst.weight.zero_()
-        patch_elems = src.weight.shape[1]
-        if patch_elems % native_c != 0:
-            n_in = min(src.weight.shape[1], dst.weight.shape[1])
-            dst.weight[:, :n_in] = src.weight[:, :n_in]
-        else:
-            spatial = patch_elems // native_c
-            unigs_c = spatial_unigs_in_channels(native_c)
-            if dst.weight.shape[1] != unigs_c * spatial:
-                n_in = min(src.weight.shape[1], dst.weight.shape[1])
-                dst.weight[:, :n_in] = src.weight[:, :n_in]
-            else:
-                src_w = src.weight.view(src.weight.shape[0], native_c, spatial)
-                dst_w = dst.weight.view(dst.weight.shape[0], unigs_c, spatial)
-                dst_w[:, :native_c] = src_w
-                dst_w[:, 2 * native_c : 3 * native_c] = src_w
-        if src.bias is not None and dst.bias is not None:
-            dst.bias.copy_(src.bias)
+def _embed_spatial_stream(transformer, latents: torch.Tensor, stream_id: int) -> torch.Tensor:
+    tokens = transformer.pos_embed(latents)
+    stream_embed = getattr(transformer, "unigs_stream_embed", None)
+    if stream_embed is not None:
+        tokens = tokens + stream_embed[stream_id].to(dtype=tokens.dtype, device=tokens.device)
+    return tokens
 
 
-def _expand_conv_patch_embed(proj: nn.Conv2d, new_in: int) -> nn.Conv2d:
-    new = nn.Conv2d(
-        new_in,
-        proj.out_channels,
-        kernel_size=proj.kernel_size,
-        stride=proj.stride,
-        padding=proj.padding,
-        bias=proj.bias is not None,
+def _concat_unigs_streams(
+    transformer,
+    image: torch.Tensor,
+    colormap: torch.Tensor,
+    control: torch.Tensor,
+    mask: torch.Tensor,
+) -> Tuple[torch.Tensor, int, int]:
+    hidden_states = torch.cat(
+        [
+            _embed_spatial_stream(transformer, image, DIT_STREAM_IMAGE),
+            _embed_spatial_stream(transformer, colormap, DIT_STREAM_COLORMAP),
+            _embed_spatial_stream(transformer, control, DIT_STREAM_CONTROL),
+            _embed_spatial_stream(transformer, mask, DIT_STREAM_MASK),
+        ],
+        dim=1,
     )
-    nn.init.zeros_(new.weight)
-    if new.bias is not None:
-        nn.init.zeros_(new.bias)
-    return new
+    height, width = image.shape[-2], image.shape[-1]
+    return hidden_states.contiguous(), height, width
 
 
-def _expand_linear(layer: nn.Linear, new_in: Optional[int] = None, new_out: Optional[int] = None) -> nn.Linear:
-    in_f = new_in if new_in is not None else layer.in_features
-    out_f = new_out if new_out is not None else layer.out_features
-    new = nn.Linear(in_f, out_f, bias=layer.bias is not None)
-    nn.init.zeros_(new.weight)
-    if new.bias is not None:
-        nn.init.zeros_(new.bias)
-    return new
-
-
-def adapt_spatial_transformer(transformer: nn.Module, family: str) -> nn.Module:
-    """Expand a spatial DiT's patch embed + output proj to UniGS ``3C+1`` / ``2*out``."""
-    native_in = native_in_channels(family)
-    native_out = native_out_channels(family)
-    new_in = spatial_unigs_in_channels(native_in)
-    new_out = spatial_unigs_out_channels(native_out)
-
-    in_ch = int(getattr(transformer.config, "in_channels", native_in))
-    out_ch = int(getattr(transformer.config, "out_channels", native_out))
-    if in_ch == new_in and out_ch == new_out:
-        return transformer
-
-    if family in ("sd3", "pixart"):
-        if not hasattr(transformer, "pos_embed") or not hasattr(transformer.pos_embed, "proj"):
-            raise TypeError(f"{family} transformer has no pos_embed.proj PatchEmbed")
-        old_proj = transformer.pos_embed.proj
-        transformer.pos_embed.proj = _expand_conv_patch_embed(old_proj, new_in)
-        _copy_conv2d_unigs_in(old_proj, transformer.pos_embed.proj, native_in)
-        old_out = transformer.proj_out
-        transformer.proj_out = _expand_linear(old_out, new_out=new_out)
-        _copy_linear_out(old_out, transformer.proj_out)
-    elif family == "z_image":
-        old_x = transformer.all_x_embedder
-        patch_vol = old_x.in_features // native_in
-        transformer.all_x_embedder = _expand_linear(old_x, new_in=new_in * patch_vol)
-        _copy_linear_in_spatial(old_x, transformer.all_x_embedder, native_in)
-        old_final = transformer.all_final_layer.linear
-        transformer.all_final_layer.linear = _expand_linear(old_final, new_out=new_out * patch_vol)
-        _copy_linear_out(old_final, transformer.all_final_layer.linear)
-        transformer.out_channels = new_out
-        transformer.in_channels = new_in
-    else:
-        raise ValueError(f"no spatial adapter for family {family!r}")
-
-    if hasattr(transformer, "config"):
-        transformer.config.in_channels = new_in
-        transformer.config.out_channels = new_out
-        transformer.config.unigs_dit_family = family
-        if hasattr(transformer, "register_to_config"):
-            transformer.register_to_config(
-                in_channels=new_in, out_channels=new_out, unigs_dit_family=family
-            )
-    return transformer
-
-
-def _as_zimage_5d(latents: torch.Tensor) -> torch.Tensor:
-    """``[B, C, H, W]`` → ``[B, C, 1, H, W]`` (Z-Image temporal axis)."""
-    if latents.ndim == 4:
-        return latents.unsqueeze(2)
-    if latents.ndim == 5:
-        return latents
-    raise ValueError(f"Z-Image latents must be 4D or 5D, got {tuple(latents.shape)}")
-
-
-def _stack_zimage_out(model_out, negate: bool) -> torch.Tensor:
-    if torch.is_tensor(model_out):
-        stacked = model_out.float()
-    else:
-        stacked = torch.stack([tensor.float() for tensor in model_out], dim=0)
-    if stacked.ndim == 5:
-        stacked = stacked.squeeze(2)
-    if negate:
-        stacked = -stacked
-    return stacked
-
-
-def forward_sd3_channel_concat(
+def forward_sd3_token_concat(
     transformer,
     image: torch.Tensor,
     colormap: torch.Tensor,
@@ -256,23 +191,61 @@ def forward_sd3_channel_concat(
     timestep: torch.Tensor,
     encoder_hidden_states: torch.Tensor,
     pooled_projections: torch.Tensor,
+    joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     return_dict: bool = False,
 ):
-    """Native SD3 forward on Fill-style channel-concatenated latents."""
-    hidden = concat_spatial_unigs(image, colormap, control, mask)
-    sample = transformer(
-        hidden_states=hidden,
-        timestep=timestep,
-        encoder_hidden_states=encoder_hidden_states,
-        pooled_projections=pooled_projections,
-        return_dict=False,
-    )[0]
+    """SD3 MMDiT forward with four visual streams concatenated after patch embed."""
+    hidden_states, height, width = _concat_unigs_streams(transformer, image, colormap, control, mask)
+    temb = transformer.time_text_embed(timestep, pooled_projections)
+    encoder_hidden_states = transformer.context_embedder(encoder_hidden_states)
+
+    if joint_attention_kwargs is not None and "ip_adapter_image_embeds" in joint_attention_kwargs:
+        joint_attention_kwargs = dict(joint_attention_kwargs)
+        ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
+        ip_hidden_states, ip_temb = transformer.image_proj(ip_adapter_image_embeds, timestep)
+        joint_attention_kwargs.update(ip_hidden_states=ip_hidden_states, temb=ip_temb)
+
+    for block in transformer.transformer_blocks:
+        if torch.is_grad_enabled() and getattr(transformer, "gradient_checkpointing", False):
+            ckpt = getattr(transformer, "_gradient_checkpointing_func", None)
+            if ckpt is not None:
+                encoder_hidden_states, hidden_states = ckpt(
+                    block, hidden_states, encoder_hidden_states, temb, joint_attention_kwargs
+                )
+            else:
+                encoder_hidden_states, hidden_states = torch.utils.checkpoint.checkpoint(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    joint_attention_kwargs,
+                    use_reentrant=False,
+                )
+        else:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+
+    hidden_states = transformer.norm_out(hidden_states, temb)
+    hidden_states = transformer.proj_out(hidden_states)
+    image_pred, colormap_pred = unpatchify_stream_tokens(
+        hidden_states,
+        height=height,
+        width=width,
+        patch_size=transformer_patch_size(transformer),
+        out_channels=transformer_out_channels(transformer),
+        num_streams=2,
+    )
+    sample = torch.cat([image_pred, colormap_pred], dim=1)
     if return_dict:
         return {"sample": sample}
     return (sample,)
 
 
-def forward_pixart_channel_concat(
+def forward_pixart_token_concat(
     transformer,
     image: torch.Tensor,
     colormap: torch.Tensor,
@@ -286,19 +259,81 @@ def forward_pixart_channel_concat(
     attention_mask: Optional[torch.Tensor] = None,
     return_dict: bool = False,
 ):
-    """Native PixArt forward on Fill-style channel-concatenated latents."""
-    hidden = concat_spatial_unigs(image, colormap, control, mask)
-    sample = transformer(
-        hidden_states=hidden,
-        encoder_hidden_states=encoder_hidden_states,
-        timestep=timestep,
-        added_cond_kwargs=added_cond_kwargs,
-        encoder_attention_mask=encoder_attention_mask,
-        cross_attention_kwargs=cross_attention_kwargs,
-        attention_mask=attention_mask,
-        return_dict=False,
-    )[0]
-    image_pred, colormap_pred = sample.chunk(2, dim=1)
+    """PixArt-α DiT forward with four visual streams concatenated after patch embed."""
+    if getattr(transformer, "use_additional_conditions", False) and added_cond_kwargs is None:
+        raise ValueError("`added_cond_kwargs` is required for PixArt checkpoints with sample_size=128.")
+
+    hidden_states, height, width = _concat_unigs_streams(transformer, image, colormap, control, mask)
+    batch_size = hidden_states.shape[0]
+    dtype = hidden_states.dtype
+
+    if attention_mask is not None and attention_mask.ndim == 2:
+        attention_mask = (1 - attention_mask.to(dtype)) * -10000.0
+        attention_mask = attention_mask.unsqueeze(1)
+    if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
+        encoder_attention_mask = (1 - encoder_attention_mask.to(dtype)) * -10000.0
+        encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
+
+    timestep_emb, embedded_timestep = transformer.adaln_single(
+        timestep, added_cond_kwargs, batch_size=batch_size, hidden_dtype=dtype
+    )
+    if transformer.caption_projection is not None:
+        encoder_hidden_states = transformer.caption_projection(encoder_hidden_states)
+        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
+
+    for block in transformer.transformer_blocks:
+        if torch.is_grad_enabled() and getattr(transformer, "gradient_checkpointing", False):
+            ckpt = getattr(transformer, "_gradient_checkpointing_func", None)
+            if ckpt is not None:
+                hidden_states = ckpt(
+                    block,
+                    hidden_states,
+                    attention_mask,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                    timestep_emb,
+                    cross_attention_kwargs,
+                    None,
+                )
+            else:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    block,
+                    hidden_states,
+                    attention_mask,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                    timestep_emb,
+                    cross_attention_kwargs,
+                    None,
+                    use_reentrant=False,
+                )
+        else:
+            hidden_states = block(
+                hidden_states,
+                attention_mask=attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                timestep=timestep_emb,
+                cross_attention_kwargs=cross_attention_kwargs,
+                class_labels=None,
+            )
+
+    shift, scale = (transformer.scale_shift_table[None] + embedded_timestep[:, None].to(transformer.scale_shift_table.device)).chunk(
+        2, dim=1
+    )
+    hidden_states = transformer.norm_out(hidden_states)
+    hidden_states = hidden_states * (1 + scale.to(hidden_states.device)) + shift.to(hidden_states.device)
+    hidden_states = transformer.proj_out(hidden_states)
+    hidden_states = hidden_states.squeeze(1)
+
+    image_pred, colormap_pred = unpatchify_stream_tokens(
+        hidden_states,
+        height=height,
+        width=width,
+        patch_size=transformer_patch_size(transformer),
+        out_channels=transformer_out_channels(transformer),
+        num_streams=2,
+    )
     latent_channels = image.shape[1]
     image_pred = maybe_drop_learned_sigma(image_pred, latent_channels)
     colormap_pred = maybe_drop_learned_sigma(colormap_pred, latent_channels)
@@ -308,7 +343,60 @@ def forward_pixart_channel_concat(
     return (sample,)
 
 
-def forward_zimage_channel_concat(
+def _as_zimage_5d(latents: torch.Tensor) -> torch.Tensor:
+    """``[B, C, H, W]`` → ``[B, C, 1, H, W]`` (Z-Image temporal axis)."""
+    if latents.ndim == 4:
+        return latents.unsqueeze(2)
+    if latents.ndim == 5:
+        return latents
+    raise ValueError(f"Z-Image latents must be 4D or 5D, got {tuple(latents.shape)}")
+
+
+def prepare_zimage_omni_inputs(
+    image: torch.Tensor,
+    colormap: torch.Tensor,
+    control: torch.Tensor,
+    mask: torch.Tensor,
+    prompt_embeds: Sequence[torch.Tensor],
+) -> Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]], List[List[int]], int]:
+    """Pack UniGS streams into Z-Image omni nested lists.
+
+    Omni ``unpatchify`` returns only the last image, so image + colormap are
+    stacked on height as the noisy target. Control and mask stay clean context.
+    """
+    image_5d = _as_zimage_5d(image)
+    colormap_5d = _as_zimage_5d(colormap)
+    control_5d = _as_zimage_5d(control)
+    mask_5d = _as_zimage_5d(mask)
+    target = torch.cat([image_5d, colormap_5d], dim=-2)
+    latent_height = image_5d.shape[-2]
+    x: List[List[torch.Tensor]] = []
+    cap: List[List[torch.Tensor]] = []
+    noise_mask: List[List[int]] = []
+    for index in range(image.shape[0]):
+        caption = prompt_embeds[index]
+        x.append([control_5d[index], mask_5d[index], target[index]])
+        cap.append([caption, caption, caption])
+        noise_mask.append([0, 0, 1])
+    return x, cap, noise_mask, latent_height
+
+
+def split_zimage_omni_output(
+    model_out: Sequence[torch.Tensor],
+    latent_height: int,
+    negate: bool = True,
+) -> torch.Tensor:
+    """Stack omni outputs, drop the temporal axis, split image / colormap, optionally negate."""
+    stacked = torch.stack([tensor.float() for tensor in model_out], dim=0)
+    if stacked.ndim == 5:
+        stacked = stacked.squeeze(2)
+    if negate:
+        stacked = -stacked
+    image_pred, colormap_pred = stacked.split(latent_height, dim=-2)
+    return torch.cat([image_pred, colormap_pred], dim=1)
+
+
+def forward_zimage_omni(
     transformer,
     image: torch.Tensor,
     colormap: torch.Tensor,
@@ -319,20 +407,22 @@ def forward_zimage_channel_concat(
     negate: bool = True,
     return_dict: bool = False,
 ):
-    """Native Z-Image forward (list of 5D maps, **not** omni nested lists)."""
-    hidden = concat_spatial_unigs(image, colormap, control, mask)
-    x = list(_as_zimage_5d(hidden).unbind(0))
-    model_out = transformer(x, timestep, list(prompt_embeds), return_dict=False)[0]
-    sample = _stack_zimage_out(model_out, negate=negate).to(dtype=image.dtype)
+    """Z-Image omni forward: control + mask context, stacked image/colormap target."""
+    x, cap_feats, image_noise_mask, latent_height = prepare_zimage_omni_inputs(
+        image, colormap, control, mask, prompt_embeds
+    )
+    model_out = transformer(
+        x,
+        timestep,
+        cap_feats,
+        return_dict=False,
+        image_noise_mask=image_noise_mask,
+    )[0]
+    sample = split_zimage_omni_output(model_out, latent_height, negate=negate)
+    sample = sample.to(dtype=image.dtype)
     if return_dict:
         return {"sample": sample}
     return (sample,)
-
-
-# Backward-compatible names used by older call sites / docs.
-forward_sd3_token_concat = forward_sd3_channel_concat
-forward_pixart_token_concat = forward_pixart_channel_concat
-forward_zimage_omni = forward_zimage_channel_concat
 
 
 def encode_sd3_prompt(

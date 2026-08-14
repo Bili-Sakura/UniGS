@@ -18,8 +18,8 @@ The UNet denoises concatenated image+colormap latents conditioned on a coarse
 mask, a control latent, and a task-prefixed CLIP prompt — the same protocol as
 training (arxiv:2312.01985). Backbone is Stable Diffusion 1.5 or 2.1 inpainting.
 
-For DiT backbones (FLUX Fill, SD 3.5, Z-Image, PixArt-α; Fill-style channel concat),
-see [`UniGSFluxPipeline`] and [`UniGSDiTPipeline`].
+For DiT backbones: FLUX Fill uses Fill-style channel concat; SD 3.5, Z-Image, and
+PixArt-α use context-token concat. See [`UniGSFluxPipeline`] and [`UniGSDiTPipeline`].
 """
 
 from __future__ import annotations

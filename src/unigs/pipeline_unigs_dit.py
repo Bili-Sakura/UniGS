@@ -14,9 +14,9 @@
 
 """UniGS inference pipeline for SD 3.5, Z-Image, and PixArt-α DiT backbones.
 
-Conditioning follows FLUX.1-Fill-dev: the coarse mask and control latent are
-concatenated on the **channel** axis of a 4D map. FLUX Fill stays on
-[`UniGSFluxPipeline`] (packed last-dim concat).
+Conditioning is **context-token concatenation** (extra visual streams), never
+channel concat. FLUX Fill stays on [`UniGSFluxPipeline`] (Fill-style packed
+channel concat).
 """
 
 from __future__ import annotations
@@ -51,9 +51,9 @@ from .dit import (
     encode_pixart_prompt,
     encode_sd3_prompt,
     encode_zimage_prompt,
-    forward_pixart_channel_concat,
-    forward_sd3_channel_concat,
-    forward_zimage_channel_concat,
+    forward_pixart_token_concat,
+    forward_sd3_token_concat,
+    forward_zimage_omni,
     pixart_added_cond_kwargs,
     resize_mask_to_latents,
 )
@@ -123,8 +123,8 @@ class UniGSDiTPipeline(DiffusionPipeline):
     UniGS on SD 3.5 Medium, Z-Image, or PixArt-α.
 
     Image and colormap latents are denoised jointly. The coarse mask and control
-    latent are concatenated on the channel axis (Fill-style), not as extra
-    sequence / omni tokens.
+    latent are extra **context tokens** (sequence concat / Z-Image omni), not
+    extra input channels.
     """
 
     model_cpu_offload_seq = "text_encoder->text_encoder_2->text_encoder_3->transformer->vae"
@@ -172,13 +172,15 @@ class UniGSDiTPipeline(DiffusionPipeline):
         self.register_to_config(unigs_dit_family=family, requires_safety_checker=requires_safety_checker)
         self.unigs_dit_family = family
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
-        self.latent_channels = int(getattr(self.vae.config, "latent_channels", None) or 16)
+        self.latent_channels = int(getattr(self.vae.config, "latent_channels", None) or transformer.config.in_channels)
+        packed = family == "z_image"
+        vae_scale = self.vae_scale_factor * (2 if packed else 1)
         self.image_processor = VaeImageProcessor(
-            vae_scale_factor=self.vae_scale_factor,
+            vae_scale_factor=vae_scale,
             vae_latent_channels=self.latent_channels,
         )
         self.mask_processor = VaeImageProcessor(
-            vae_scale_factor=self.vae_scale_factor,
+            vae_scale_factor=vae_scale,
             vae_latent_channels=self.latent_channels,
             do_normalize=False,
             do_binarize=True,
@@ -455,6 +457,7 @@ class UniGSDiTPipeline(DiffusionPipeline):
             coarse_mask.to(device=device, dtype=dtype),
             latent_height=latent_h,
             latent_width=latent_w,
+            latent_channels=self.latent_channels,
         )
         if mask_latents.shape[0] < batch_size:
             mask_latents = mask_latents.repeat(batch_size // mask_latents.shape[0], 1, 1, 1)
@@ -487,12 +490,12 @@ class UniGSDiTPipeline(DiffusionPipeline):
                 mask_in = torch.cat([mask, mask], dim=0)
                 caps = list(encoded["prompt_embeds"]) + list(encoded["negative_prompt_embeds"])
                 timestep_in = timestep.repeat(2)
-                pred = forward_zimage_channel_concat(
+                pred = forward_zimage_omni(
                     self.transformer, image_in, colormap_in, control_in, mask_in, timestep_in, caps, negate=True
                 )[0]
                 cond, uncond = pred.chunk(2)
                 return uncond + guidance_scale * (cond - uncond)
-            return forward_zimage_channel_concat(
+            return forward_zimage_omni(
                 self.transformer, image, colormap, control, mask, timestep, encoded["prompt_embeds"], negate=True
             )[0]
 
@@ -509,7 +512,7 @@ class UniGSDiTPipeline(DiffusionPipeline):
                     [encoded["negative_pooled_prompt_embeds"], encoded["pooled_prompt_embeds"]], dim=0
                 )
                 timestep_in = timestep.repeat(2)
-                pred = forward_sd3_channel_concat(
+                pred = forward_sd3_token_concat(
                     self.transformer,
                     image_in,
                     colormap_in,
@@ -521,7 +524,7 @@ class UniGSDiTPipeline(DiffusionPipeline):
                 )[0]
                 uncond, cond = pred.chunk(2)
                 return uncond + guidance_scale * (cond - uncond)
-            return forward_sd3_channel_concat(
+            return forward_sd3_token_concat(
                 self.transformer,
                 image,
                 colormap,
@@ -549,7 +552,7 @@ class UniGSDiTPipeline(DiffusionPipeline):
             prompt_embeds = torch.cat([encoded["negative_prompt_embeds"], encoded["prompt_embeds"]], dim=0)
             attn = torch.cat([encoded["negative_prompt_attention_mask"], encoded["prompt_attention_mask"]], dim=0)
             timestep_in = timestep.repeat(2)
-            pred = forward_pixart_channel_concat(
+            pred = forward_pixart_token_concat(
                 self.transformer,
                 image_in,
                 colormap_in,
@@ -562,7 +565,7 @@ class UniGSDiTPipeline(DiffusionPipeline):
             )[0]
             uncond, cond = pred.chunk(2)
             return uncond + guidance_scale * (cond - uncond)
-        return forward_pixart_channel_concat(
+        return forward_pixart_token_concat(
             self.transformer,
             image,
             colormap,

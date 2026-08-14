@@ -18,14 +18,14 @@ FLUX.1-Fill-dev concatenates **on the packed channel axis** (last dim)::
 
     hidden = cat(noisy_64, masked_image_64, mask_256, dim=-1)  # 384
 
-UniGS follows the same style for all four streams::
+UniGS FLUX follows that style and adds a noisy colormap stream::
 
     hidden = cat(img_64, cmap_64, control_64, mask_256, dim=-1)  # 448
     pred   = transformer(...)  # [B, S, 128] = packed image + packed colormap
 
-A single RoPE ``img_ids`` grid is used (Fill's layout), not four stream ids.
-Spatial DiTs (SD 3.5, PixArt, Z-Image) use the analog on 4D maps — see
-:mod:`unigs.dit`.
+A single RoPE ``img_ids`` grid is used (Fill's layout). SD 3.5, PixArt-α, and
+Z-Image keep native ``in_channels`` and use **context-token** concat instead
+— see :mod:`unigs.dit`.
 """
 
 from __future__ import annotations
@@ -276,13 +276,15 @@ def _guess_flux_family(transformer) -> bool:
 
 
 def adapt_unigs_transformer(transformer, zero_init: bool = True, family: Optional[str] = None, pretrained: Optional[str] = None):
-    """Expand Fill (384→64) or a spatial DiT to UniGS channel-concat I/O.
+    """Adapt a DiT to UniGS.
 
-    FLUX.1-Fill-dev: ``x_embedder`` 384→448, ``proj_out`` 64→128, with Fill
-    column remapping. Spatial families are adapted in
-    :func:`unigs.dit.adapt_spatial_transformer`.
+    * **FLUX.1-Fill-dev** — Fill-style channel concat: ``x_embedder`` 384→448,
+      ``proj_out`` 64→128, with Fill column remapping.
+    * **SD 3.5 / PixArt-α** — keep native ``in_channels``; register a zero-init
+      ``unigs_stream_embed`` so stream 0 matches the pretrained image path.
+    * **Z-Image** — keep native omni embedders; mark ``unigs_dit_family``.
     """
-    del zero_init  # extra channels are always zero-init then overwritten where pretrained
+    del zero_init  # extra FLUX channels are always zero-init then overwritten where pretrained
     family = family or family_from_pretrained(pretrained, transformer) or infer_transformer_family(transformer)
     if family is None and _guess_flux_family(transformer):
         family = "flux"
@@ -291,15 +293,17 @@ def adapt_unigs_transformer(transformer, zero_init: bool = True, family: Optiona
             "Cannot infer DiT family for UniGS adapter; pass family='flux'|'sd3'|'z_image'|'pixart'."
         )
 
-    if family != "flux":
-        from .dit import adapt_spatial_transformer
+    if family in {"sd3", "pixart", "z_image"}:
+        from .dit import ensure_unigs_stream_embed
 
-        adapted = adapt_spatial_transformer(transformer, family)
-        if hasattr(adapted, "register_to_config"):
-            adapted.register_to_config(unigs_dit_family=family)
-        elif hasattr(adapted, "config"):
-            adapted.config.unigs_dit_family = family
-        return adapted
+        if family in {"sd3", "pixart"}:
+            ensure_unigs_stream_embed(transformer)
+        if hasattr(transformer, "register_to_config"):
+            transformer.register_to_config(unigs_dit_family=family)
+        elif hasattr(transformer, "config"):
+            transformer.config.unigs_dit_family = family
+        logger.info("Registered UniGS token-concat adapter on %s DiT (native in_channels).", family)
+        return transformer
 
     in_ch = int(getattr(transformer.config, "in_channels", 0))
     out_ch = int(getattr(transformer.config, "out_channels", 0))

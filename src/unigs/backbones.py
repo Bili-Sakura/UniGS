@@ -15,9 +15,8 @@
 """Supported UniGS backbones: SD inpainting UNets and DiT families.
 
 UNet backbones must be *inpainting* checkpoints (9-in). DiT backbones may be
-text-to-image or inpainting checkpoints. **All** UniGS DiTs condition the way
-FLUX.1-Fill-dev does: the coarse mask (and control latent) are concatenated on
-the **channel** axis, never as extra sequence / context tokens.
+text-to-image or inpainting checkpoints. **FLUX.1-Fill-dev** keeps Fill-style
+channel concat; SD 3.5 / Z-Image / PixArt-α use context-token concat.
 """
 
 from __future__ import annotations
@@ -35,9 +34,9 @@ UNET_BACKBONES = {
 
 # DiT families. FLUX.1-Fill-dev is an inpainting checkpoint whose native
 # condition is packed channel-concat (`cat(noisy, masked_image, mask)` → 384).
-# UniGS keeps that style and adds a noisy colormap stream. SD3.5 / Z-Image /
-# PixArt-α are text-to-image DiTs adapted the same way: extra input channels
-# for colormap + control + mask, extra output channels for the colormap.
+# UniGS FLUX keeps that style and adds a noisy colormap stream (448-in).
+# SD3.5 / Z-Image / PixArt-α are text-to-image DiTs that keep native
+# `in_channels` and condition with extra visual **context tokens**.
 DIT_BACKBONES = {
     "flux": "black-forest-labs/FLUX.1-Fill-dev",
     "flux_fill": "black-forest-labs/FLUX.1-Fill-dev",
@@ -118,7 +117,12 @@ UNIGS_DIT_PACKED_OUT_CHANNELS = 128  # packed image + colormap
 SD3_LATENT_CHANNELS = 16
 ZIMAGE_LATENT_CHANNELS = 16
 PIXART_LATENT_CHANNELS = 4
-SPATIAL_MASK_CHANNELS = 1  # latent-resolution mask concatenated on the channel axis
+
+# Sequence-concat stream ids for SD 3.5 / PixArt (Z-Image uses omni lists).
+DIT_STREAM_IMAGE = 0
+DIT_STREAM_COLORMAP = 1
+DIT_STREAM_CONTROL = 2
+DIT_STREAM_MASK = 3
 
 _TRANSFORMER_CLASS_TO_FAMILY = {
     "FluxTransformer2DModel": "flux",
@@ -217,16 +221,6 @@ def native_out_channels(family: str) -> int:
     if family not in DIT_FAMILY_NATIVE_OUT_CHANNELS:
         raise ValueError(f"family {family!r} has no spatial native out_channels")
     return DIT_FAMILY_NATIVE_OUT_CHANNELS[family]
-
-
-def spatial_unigs_in_channels(latent_channels: int, mask_channels: int = SPATIAL_MASK_CHANNELS) -> int:
-    """``[z_image, z_colormap, z_control, mask]`` channel count."""
-    return int(latent_channels) * 3 + int(mask_channels)
-
-
-def spatial_unigs_out_channels(native_out: int) -> int:
-    """Dual-stream (image + colormap) output channels."""
-    return int(native_out) * 2
 
 
 def infer_transformer_family(transformer) -> Optional[str]:
