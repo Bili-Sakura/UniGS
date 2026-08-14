@@ -1,6 +1,6 @@
 # UniGS
 
-Unofficial implementation of [UniGS: Unified Representation for Image Generation and Segmentation](https://arxiv.org/abs/2312.01985) on **Stable Diffusion inpainting** backbones (SD 1.5 / 2.1), written in native 🤗 Diffusers style so it can be dropped into `examples/research_projects/unigs` (training) and `examples/community` (inference) with almost no changes.
+Unofficial implementation of [UniGS: Unified Representation for Image Generation and Segmentation](https://arxiv.org/abs/2312.01985) on **Stable Diffusion inpainting** UNets (SD 1.5 / 2.1) and **FLUX.1-Fill-dev** (DiT), written in native 🤗 Diffusers style so it can be dropped into `examples/research_projects/unigs` (training) and `examples/community` (inference) with almost no changes.
 
 UniGS treats entity-level masks as an RGB **colormap** that lives in the same VAE latent space as images. A dual-output UNet denoises both jointly inside an inpainting protocol, which is enough to cover four tasks from one representation:
 
@@ -18,7 +18,16 @@ The UNet starts from the standard SD **inpainting** `UNet2DConditionModel` (9 in
 
 Newly added `conv_in` / `conv_out` weights are zero-initialized. Existing inpainting channels (noisy image, mask, control latent) are copied from the pretrained UNet; colormap channels are zero-initialized — matching the paper.
 
-Base text-to-image checkpoints (`stable-diffusion-v1-5`, `stable-diffusion-2-1`, etc.) are **not** supported.
+**FLUX.1-Fill-dev (DiT).** Fill's native condition is channel-concat of packed noisy latents, masked-image latents, and mask (`in_channels=384`). UniGS instead follows FLUX.1 Kontext: every stream is a 64-dim packed token sequence, concatenated on the **sequence** axis, with RoPE ids `(t, h, w)`:
+
+* `t=0` noisy image (denoised)
+* `t=1` noisy colormap (denoised)
+* `t=2` control latent (context only)
+* `t=3` coarse mask (context only)
+
+`x_embedder` is shrunk 384→64 by copying Fill's packed noisy-latent columns. Text is CLIP pooled + T5; training is flow matching.
+
+Base text-to-image checkpoints (`stable-diffusion-v1-5`, `stable-diffusion-2-1`, `FLUX.1-dev`, etc.) are **not** supported.
 
 ## Layout
 
@@ -31,12 +40,16 @@ src/
   requirements.txt
   unigs/
     pipeline_unigs.py         # DiffusionPipeline (community-pipeline style)
-    backbones.py              # sd15 / sd21 inpainting Hub ids
+    pipeline_unigs_flux.py    # FLUX Fill DiT pipeline (context-token concat)
+    backbones.py              # sd15 / sd21 / flux Hub ids
     unet.py                   # 9 → 13-in, 4 → 8-out adapter
+    transformer.py            # Fill 384-in → UniGS 64-in token-concat adapter
     colormap.py               # location-aware palette Ψ + progressive dichotomy Φ
     coarse_mask.py            # Ω, Bezier / extended-bbox coarse masks
     prompts.py                # Table 2 templates
     dataset.py                # COCO / 🤗 Datasets → UniGS batches
+tests/
+  test_dit_tokens.py          # pack / RoPE ids / Fill→64-in adapter
 ```
 
 ## Installation
@@ -47,10 +60,13 @@ pip install -r src/requirements.txt
 
 Supported inpainting backbones (use `--backbone` or pass the Hub id explicitly):
 
-| Shorthand | Checkpoint |
-| --- | --- |
-| `sd15` (paper default) | `stable-diffusion-v1-5/stable-diffusion-inpainting` |
-| `sd21` | `stabilityai/stable-diffusion-2-inpainting` |
+| Shorthand | Checkpoint | Conditioning |
+| --- | --- | --- |
+| `sd15` (paper default) | `stable-diffusion-v1-5/stable-diffusion-inpainting` | channel concat (13-in UNet) |
+| `sd21` | `stabilityai/stable-diffusion-2-inpainting` | channel concat (13-in UNet) |
+| `flux` / `flux_fill` | `black-forest-labs/FLUX.1-Fill-dev` | context-token concat (64-in DiT) |
+
+FLUX.1-Fill-dev is gated — accept the license on the Hub and `hf auth login` before training or bootstrapping.
 
 ## Training
 
@@ -94,6 +110,29 @@ accelerate launch src/train_unigs.py \
 
 The run writes a full `UniGSPipeline` via `save_pretrained`, so the UNet config records `in_channels=13` and `out_channels=8`.
 
+FLUX.1-Fill-dev (context-token concat; LoRA is recommended because the transformer is 12B):
+
+```bash
+accelerate launch src/train_unigs.py \
+  --backbone=flux \
+  --coco_image_dir=/data/coco/train2017 \
+  --coco_annotation_file=/data/coco/annotations/instances_train2017.json \
+  --output_dir=unigs-flux-fill \
+  --resolution=512 \
+  --train_batch_size=1 \
+  --gradient_accumulation_steps=4 \
+  --learning_rate=1e-4 \
+  --lora_rank=16 \
+  --max_train_steps=10000 \
+  --checkpointing_steps=1000 \
+  --mixed_precision=bf16 \
+  --gradient_checkpointing \
+  --task=joint \
+  --conditioning_dropout_prob=0.1
+```
+
+Resolution must be divisible by 16 (8× VAE and 2×2 packing). The saved pipeline is a `UniGSFluxPipeline` with `transformer.in_channels=64`.
+
 ## Inference
 
 Load a trained directory as a Diffusers pipeline:
@@ -122,6 +161,8 @@ from unigs import UniGSPipeline
 
 pipe = UniGSPipeline.from_inpainting(backbone="sd15", torch_dtype=torch.float16)
 # or: UniGSPipeline.from_inpainting("stabilityai/stable-diffusion-2-inpainting")
+# DiT: UniGSPipeline.from_inpainting(backbone="flux", torch_dtype=torch.bfloat16)
+#   dispatches to UniGSFluxPipeline (context-token concat).
 ```
 
 The other Table-2 tasks:
@@ -144,6 +185,19 @@ python src/infer_unigs.py \
   --output-dir out
 ```
 
+FLUX Fill (guidance default 30; bf16 recommended):
+
+```bash
+python src/infer_unigs.py \
+  --backbone flux \
+  --task inpainting \
+  --prompt dog \
+  --image scene.png \
+  --mask hole.png \
+  --dtype bf16 \
+  --output-dir out
+```
+
 ## Method notes
 
 **Location-aware palette (Ψ).** Each RGB channel uses `{0, 64, 128, 192, 255}` (124 colors after dropping black). The image is tiled into an `11 × 11` grid; an entity inherits the color of the cell that contains its center of mass. Collision fallback walks to the next unused cell.
@@ -152,7 +206,7 @@ python src/infer_unigs.py \
 
 **Coarse mask (Ω).** With probability `--arbitrary_mask_prob` a quadratic-Bezier blob is drawn around the entity bbox (Paint-by-Example / supplementary Alg. 1); otherwise an extended rectangle is used. Synthesis and entity segmentation pass an all-ones mask.
 
-**VAE.** Colormaps are encoded and decoded with the same `AutoencoderKL` as RGB images. SD inpainting uses an 8× VAE downscale (`vae_scale_factor`).
+**VAE.** Colormaps are encoded and decoded with the same `AutoencoderKL` as RGB images. SD inpainting uses an 8× VAE downscale (`vae_scale_factor`). FLUX uses the 16-channel Fill VAE plus 2×2 token packing.
 
 ## Mapping onto Diffusers
 
@@ -162,4 +216,4 @@ To upstream this as an official example:
 2. Move `src/train_unigs.py` + `src/unigs/` → `examples/research_projects/unigs/`.
 3. Load with `DiffusionPipeline.from_pretrained(..., custom_pipeline="pipeline_unigs")` once the community file is in tree.
 
-No custom CUDA ops, no extra segmentation losses — training is standard latent-diffusion MSE on the 8-channel noise.
+No custom CUDA ops, no extra segmentation losses — UNet training is standard latent-diffusion MSE on the 8-channel noise; FLUX training is flow-matching MSE on unpacked image + colormap latents.

@@ -152,13 +152,14 @@ class UniGSInstanceDataset(Dataset):
     * ``colormap_values`` — location-aware entity colormap in ``[-1, 1]``
     * ``control_values`` — task-dependent control image in ``[-1, 1]``
     * ``coarse_mask`` — ``(1, H, W)`` mask, ``1`` = region to fill
-    * ``input_ids`` — CLIP token ids for the task prompt
+    * ``prompt`` — task-prefixed text prompt (always)
+    * ``input_ids`` — CLIP token ids when ``tokenizer`` is provided (UNet backbones)
     """
 
     def __init__(
         self,
         records: Sequence[Dict[str, Any]],
-        tokenizer,
+        tokenizer=None,
         resolution: int = 512,
         task: str = "joint",
         max_entities: int = 4,
@@ -273,14 +274,6 @@ class UniGSInstanceDataset(Dataset):
         if self.caption_column and record.get("caption") and task == "synthesis":
             prompt = f"synthesis: {record['caption']}"
 
-        input_ids = self.tokenizer(
-            prompt,
-            max_length=self.tokenizer.model_max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        ).input_ids[0]
-
         coarse_tensor = TF.to_tensor(coarse_mask)
         if coarse_tensor.max() > 1.0:
             coarse_tensor = coarse_tensor / 255.0
@@ -296,25 +289,36 @@ class UniGSInstanceDataset(Dataset):
         else:
             control_values = pixel_values
 
-        return {
+        sample: Dict[str, Any] = {
             "pixel_values": pixel_values,
             "colormap_values": colormap_values,
             "control_values": control_values,
             "coarse_mask": coarse_tensor,
-            "input_ids": input_ids,
             "prompt": prompt,
             "task": task,
         }
+        if self.tokenizer is not None:
+            sample["input_ids"] = self.tokenizer(
+                prompt,
+                max_length=self.tokenizer.model_max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            ).input_ids[0]
+        return sample
 
 
-def collate_fn(examples: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-    return {
+def collate_fn(examples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    batch: Dict[str, Any] = {
         "pixel_values": torch.stack([ex["pixel_values"] for ex in examples]),
         "colormap_values": torch.stack([ex["colormap_values"] for ex in examples]),
         "control_values": torch.stack([ex["control_values"] for ex in examples]),
         "coarse_mask": torch.stack([ex["coarse_mask"] for ex in examples]),
-        "input_ids": torch.stack([ex["input_ids"] for ex in examples]),
+        "prompts": [ex["prompt"] for ex in examples],
     }
+    if "input_ids" in examples[0]:
+        batch["input_ids"] = torch.stack([ex["input_ids"] for ex in examples])
+    return batch
 
 
 def load_coco_records(image_dir: str, annotation_file: str, min_area: int = 32) -> List[Dict[str, Any]]:

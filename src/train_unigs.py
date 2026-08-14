@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fine-tune Stable Diffusion inpainting backbones as UniGS with 🤗 Accelerate.
+"""Fine-tune Stable Diffusion inpainting UNets or FLUX.1-Fill-dev as UniGS.
 
-Example:
+UNet example:
     accelerate launch src/train_unigs.py \\
         --backbone=sd15 \\
         --coco_image_dir=/data/coco/train2017 \\
@@ -23,11 +23,22 @@ Example:
         --resolution=512 --train_batch_size=4 --gradient_accumulation_steps=4 \\
         --learning_rate=5e-5 --max_train_steps=30000 --checkpointing_steps=5000 \\
         --mixed_precision=fp16 --task=joint
+
+FLUX Fill DiT example (context-token concat; LoRA recommended):
+    accelerate launch src/train_unigs.py \\
+        --backbone=flux \\
+        --coco_image_dir=/data/coco/train2017 \\
+        --coco_annotation_file=/data/coco/annotations/instances_train2017.json \\
+        --output_dir=unigs-flux-fill \\
+        --resolution=512 --train_batch_size=1 --gradient_accumulation_steps=4 \\
+        --learning_rate=1e-4 --lora_rank=16 --max_train_steps=10000 \\
+        --mixed_precision=bf16 --gradient_checkpointing --task=joint
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import math
 import os
@@ -62,10 +73,24 @@ from diffusers.utils.torch_utils import is_compiled_module
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from unigs.backbones import INPAINTING_BACKBONES, INPAINTING_UNET_IN_CHANNELS, resolve_inpainting_checkpoint
+from unigs.backbones import (
+    INPAINTING_BACKBONES,
+    INPAINTING_UNET_IN_CHANNELS,
+    is_dit_checkpoint,
+    resolve_inpainting_checkpoint,
+)
 from unigs.dataset import UniGSInstanceDataset, collate_fn, load_coco_records, records_from_hf_dataset
 from unigs.pipeline_unigs import UniGSPipeline
 from unigs.prompts import TASK_NAMES, TASK_PROMPT_TEMPLATES
+from unigs.transformer import (
+    adapt_unigs_transformer,
+    concat_context_tokens,
+    encode_vae_latents,
+    pack_latents,
+    pack_mask_as_tokens,
+    split_target_tokens,
+    unpack_latents,
+)
 from unigs.unet import adapt_unigs_unet
 
 
@@ -81,21 +106,22 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train UniGS on an SD inpainting backbone.")
+    parser = argparse.ArgumentParser(description="Train UniGS on an SD inpainting UNet or FLUX Fill DiT backbone.")
     parser.add_argument(
         "--backbone",
         type=str,
         default="sd15",
         choices=list(INPAINTING_BACKBONES),
-        help="Inpainting checkpoint shorthand when --pretrained_model_name_or_path is omitted.",
+        help="Checkpoint shorthand when --pretrained_model_name_or_path is omitted (`sd15`, `sd21`, `flux`).",
     )
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
         default=None,
         help=(
-            "Hub id or local path to an SD *inpainting* checkpoint "
-            f"({INPAINTING_BACKBONES['sd15']} or {INPAINTING_BACKBONES['sd21']}). "
+            "Hub id or local path. UNet inpainting: "
+            f"{INPAINTING_BACKBONES['sd15']} / {INPAINTING_BACKBONES['sd21']}. "
+            f"DiT: {INPAINTING_BACKBONES['flux']} (context-token concat). "
             "Overrides --backbone when set."
         ),
     )
@@ -185,6 +211,35 @@ def parse_args():
     parser.add_argument("--num_validation_images", type=int, default=1)
     parser.add_argument("--validation_steps", type=int, default=500)
     parser.add_argument("--tracker_project_name", type=str, default="unigs")
+    parser.add_argument(
+        "--max_sequence_length",
+        type=int,
+        default=512,
+        help="T5 token length for FLUX Fill. Ignored for SD UNet backbones.",
+    )
+    parser.add_argument(
+        "--train_guidance_scale",
+        type=float,
+        default=1.0,
+        help="Guidance embedding value while training distilled FLUX Fill. Ignored for UNets.",
+    )
+    parser.add_argument(
+        "--weighting_scheme",
+        type=str,
+        default="none",
+        choices=["sigma_sqrt", "logit_normal", "mode", "cosmap", "none"],
+        help="Flow-matching timestep sampling / loss weighting (FLUX only).",
+    )
+    parser.add_argument("--logit_mean", type=float, default=0.0)
+    parser.add_argument("--logit_std", type=float, default=1.0)
+    parser.add_argument("--mode_scale", type=float, default=1.29)
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=None,
+        help="If set, train LoRA on the DiT attention projections (x_embedder stays fully trainable).",
+    )
+    parser.add_argument("--lora_alpha", type=int, default=None)
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -202,6 +257,308 @@ def unwrap_model(accelerator, model):
     model = accelerator.unwrap_model(model)
     model = model._orig_mod if is_compiled_module(model) else model
     return model
+
+
+def _import_flux():
+    try:
+        from diffusers import FlowMatchEulerDiscreteScheduler, FluxTransformer2DModel
+        from transformers import T5EncoderModel, T5TokenizerFast
+    except ImportError as err:
+        raise ImportError(
+            "FLUX UniGS training requires diffusers>=0.32.0 with FluxTransformer2DModel "
+            "and transformers T5EncoderModel / T5TokenizerFast."
+        ) from err
+    return FluxTransformer2DModel, FlowMatchEulerDiscreteScheduler, T5EncoderModel, T5TokenizerFast
+
+
+def _apply_dit_lora(transformer, rank: int, alpha: Optional[int] = None):
+    try:
+        from peft import LoraConfig
+    except ImportError as err:
+        raise ImportError("Install peft to train FLUX with LoRA: `pip install peft`.") from err
+    transformer.requires_grad_(False)
+    transformer.x_embedder.requires_grad_(True)
+    if getattr(transformer, "proj_out", None) is not None:
+        transformer.proj_out.requires_grad_(True)
+    transformer.add_adapter(
+        LoraConfig(
+            r=rank,
+            lora_alpha=alpha or rank,
+            init_lora_weights="gaussian",
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        )
+    )
+    return transformer
+
+
+def _trainable_parameters(model):
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise ValueError("No trainable parameters found.")
+    return params
+
+
+def _dit_sigmas(noise_scheduler, timesteps, n_dim=4, dtype=torch.float32):
+    sigmas = noise_scheduler.sigmas.to(device=timesteps.device, dtype=dtype)
+    schedule_timesteps = noise_scheduler.timesteps.to(timesteps.device)
+    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+    sigma = sigmas[step_indices].flatten()
+    while len(sigma.shape) < n_dim:
+        sigma = sigma.unsqueeze(-1)
+    return sigma
+
+
+def _sample_flow_timesteps(noise_scheduler, batch_size, device, args):
+    try:
+        from diffusers.training_utils import compute_density_for_timestep_sampling
+
+        u = compute_density_for_timestep_sampling(
+            weighting_scheme=args.weighting_scheme,
+            batch_size=batch_size,
+            logit_mean=args.logit_mean,
+            logit_std=args.logit_std,
+            mode_scale=args.mode_scale,
+        )
+    except Exception:
+        u = torch.rand(batch_size, device=device)
+    indices = (u * noise_scheduler.config.num_train_timesteps).long()
+    return noise_scheduler.timesteps[indices].to(device=device)
+
+
+def _flow_loss_weighting(sigmas, args):
+    try:
+        from diffusers.training_utils import compute_loss_weighting_for_sd3
+
+        return compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+    except Exception:
+        return torch.ones_like(sigmas)
+
+
+def _encode_flux_batch(text_encoder, text_encoder_2, tokenizer, tokenizer_2, prompts, device, max_sequence_length):
+    from unigs.pipeline_unigs_flux import encode_flux_prompt
+
+    return encode_flux_prompt(
+        text_encoder,
+        text_encoder_2,
+        tokenizer,
+        tokenizer_2,
+        prompts,
+        device,
+        max_sequence_length=max_sequence_length,
+    )
+
+
+def _unet_training_step(batch, args, vae, unet, text_encoder, tokenizer, noise_scheduler, weight_dtype):
+    image_latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
+    image_latents = image_latents * vae.config.scaling_factor
+    colormap_latents = vae.encode(batch["colormap_values"].to(weight_dtype)).latent_dist.sample()
+    colormap_latents = colormap_latents * vae.config.scaling_factor
+    latents = torch.cat([image_latents, colormap_latents], dim=1)
+
+    noise = torch.randn_like(latents)
+    if args.noise_offset:
+        noise = noise + args.noise_offset * torch.randn(
+            (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+        )
+    bsz = latents.shape[0]
+    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
+    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+    control_latents = vae.encode(batch["control_values"].to(weight_dtype)).latent_dist.mode()
+    control_latents = control_latents * vae.config.scaling_factor
+    coarse_mask = F.interpolate(
+        batch["coarse_mask"].to(dtype=weight_dtype, device=latents.device),
+        size=noisy_latents.shape[-2:],
+        mode="nearest",
+    )
+
+    if args.conditioning_dropout_prob is not None and args.conditioning_dropout_prob > 0:
+        random_p = torch.rand(bsz, device=latents.device)
+        prompt_mask = (random_p < args.conditioning_dropout_prob).reshape(bsz, 1, 1)
+        drop_ids = tokenizer(
+            [""] * bsz,
+            max_length=tokenizer.model_max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids.to(latents.device)
+        null_conditioning = text_encoder(drop_ids)[0]
+        encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)
+
+    model_input = torch.cat([noisy_latents, coarse_mask, control_latents], dim=1)
+    if noise_scheduler.config.prediction_type == "epsilon":
+        target = noise
+    elif noise_scheduler.config.prediction_type == "v_prediction":
+        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+    else:
+        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+    model_pred = unet(model_input, timesteps, encoder_hidden_states, return_dict=False)[0]
+    if args.loss_on_mask_only:
+        loss_mask = coarse_mask.expand_as(model_pred)
+        loss = F.mse_loss(model_pred.float() * loss_mask, target.float() * loss_mask, reduction="sum")
+        return loss / torch.clamp(loss_mask.sum(), min=1.0)
+    if args.snr_gamma is None:
+        return F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+    snr = compute_snr(noise_scheduler, timesteps)
+    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0]
+    if noise_scheduler.config.prediction_type == "epsilon":
+        mse_loss_weights = mse_loss_weights / snr
+    elif noise_scheduler.config.prediction_type == "v_prediction":
+        mse_loss_weights = mse_loss_weights / (snr + 1)
+    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+    return loss.mean()
+
+
+def _dit_training_step(
+    batch,
+    args,
+    vae,
+    transformer,
+    text_encoder,
+    text_encoder_2,
+    tokenizer,
+    tokenizer_2,
+    noise_scheduler,
+    weight_dtype,
+    accelerator,
+):
+    prompts = list(batch["prompts"])
+    pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
+    colormap_values = batch["colormap_values"].to(dtype=weight_dtype)
+    control_values = batch["control_values"].to(dtype=weight_dtype)
+    bsz = pixel_values.shape[0]
+    device = accelerator.device
+
+    with torch.no_grad():
+        image_latents = encode_vae_latents(vae, pixel_values, sample_mode="sample")
+        colormap_latents = encode_vae_latents(vae, colormap_values, sample_mode="sample")
+        control_latents = encode_vae_latents(vae, control_values, sample_mode="argmax")
+    image_latents = image_latents.to(dtype=weight_dtype)
+    colormap_latents = colormap_latents.to(dtype=weight_dtype)
+    control_latents = control_latents.to(dtype=weight_dtype)
+
+    if args.conditioning_dropout_prob is not None and args.conditioning_dropout_prob > 0:
+        drop = torch.rand(bsz, device=device) < args.conditioning_dropout_prob
+        prompts = ["" if flag else prompt for flag, prompt in zip(drop.tolist(), prompts)]
+
+    with torch.no_grad():
+        prompt_embeds, pooled_prompt_embeds, text_ids = _encode_flux_batch(
+            text_encoder,
+            text_encoder_2,
+            tokenizer,
+            tokenizer_2,
+            prompts,
+            device,
+            args.max_sequence_length,
+        )
+    prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
+    pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=weight_dtype)
+    text_ids = text_ids.to(dtype=weight_dtype)
+
+    noise_image = torch.randn_like(image_latents)
+    noise_colormap = torch.randn_like(colormap_latents)
+    timesteps = _sample_flow_timesteps(noise_scheduler, bsz, image_latents.device, args)
+    sigmas = _dit_sigmas(noise_scheduler, timesteps, n_dim=image_latents.ndim, dtype=image_latents.dtype)
+    noisy_image = (1.0 - sigmas) * image_latents + sigmas * noise_image
+    noisy_colormap = (1.0 - sigmas) * colormap_latents + sigmas * noise_colormap
+
+    latent_h, latent_w = image_latents.shape[2], image_latents.shape[3]
+    packed_h, packed_w = latent_h // 2, latent_w // 2
+    image_tokens = pack_latents(noisy_image)
+    colormap_tokens = pack_latents(noisy_colormap)
+    control_tokens = pack_latents(control_latents)
+    mask_tokens = pack_mask_as_tokens(
+        batch["coarse_mask"].to(device=device, dtype=weight_dtype),
+        latent_height=latent_h,
+        latent_width=latent_w,
+        latent_channels=image_latents.shape[1],
+    )
+    hidden_states, img_ids, target_seq_len = concat_context_tokens(
+        image_tokens, colormap_tokens, control_tokens, mask_tokens, packed_h, packed_w
+    )
+
+    if getattr(unwrap_model(accelerator, transformer).config, "guidance_embeds", False):
+        guidance = torch.full((bsz,), args.train_guidance_scale, device=device, dtype=torch.float32)
+    else:
+        guidance = None
+
+    model_pred = transformer(
+        hidden_states=hidden_states,
+        timestep=timesteps / 1000,
+        guidance=guidance,
+        pooled_projections=pooled_prompt_embeds,
+        encoder_hidden_states=prompt_embeds,
+        txt_ids=text_ids,
+        img_ids=img_ids,
+        return_dict=False,
+    )[0]
+    pred_image_tokens, pred_colormap_tokens = split_target_tokens(model_pred, target_seq_len)
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    pred_image = unpack_latents(pred_image_tokens, args.resolution, args.resolution, vae_scale_factor)
+    pred_colormap = unpack_latents(pred_colormap_tokens, args.resolution, args.resolution, vae_scale_factor)
+    model_pred = torch.cat([pred_image, pred_colormap], dim=1)
+    target = torch.cat([noise_image - image_latents, noise_colormap - colormap_latents], dim=1)
+
+    weighting = _flow_loss_weighting(sigmas, args)
+    if args.loss_on_mask_only:
+        loss_mask = F.interpolate(
+            batch["coarse_mask"].to(device=device, dtype=model_pred.dtype),
+            size=model_pred.shape[-2:],
+            mode="nearest",
+        ).expand_as(model_pred)
+        loss = F.mse_loss(model_pred.float() * loss_mask, target.float() * loss_mask, reduction="sum")
+        return loss / torch.clamp(loss_mask.sum(), min=1.0)
+
+    loss = (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1)
+    return loss.mean()
+
+
+def _build_validation_pipeline(
+    args,
+    accelerator,
+    vae,
+    text_encoder,
+    text_encoder_2,
+    tokenizer,
+    tokenizer_2,
+    unet,
+    transformer,
+    noise_scheduler,
+    final: bool = False,
+):
+    if args.dit:
+        from unigs.pipeline_unigs_flux import UniGSFluxPipeline
+
+        _, FlowMatchEulerDiscreteScheduler, _, _ = _import_flux()
+        scheduler = (
+            FlowMatchEulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+            if final
+            else FlowMatchEulerDiscreteScheduler.from_config(noise_scheduler.config)
+        )
+        return UniGSFluxPipeline(
+            vae=unwrap_model(accelerator, vae),
+            text_encoder=unwrap_model(accelerator, text_encoder),
+            tokenizer=tokenizer,
+            text_encoder_2=unwrap_model(accelerator, text_encoder_2),
+            tokenizer_2=tokenizer_2,
+            transformer=unwrap_model(accelerator, transformer),
+            scheduler=scheduler,
+        )
+    scheduler = (
+        DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+        if final
+        else DDIMScheduler.from_config(noise_scheduler.config)
+    )
+    return UniGSPipeline(
+        vae=unwrap_model(accelerator, vae),
+        text_encoder=unwrap_model(accelerator, text_encoder),
+        tokenizer=tokenizer,
+        unet=unwrap_model(accelerator, unet),
+        scheduler=scheduler,
+    )
 
 
 def log_validation(pipeline, args, accelerator, weight_dtype, step):
@@ -254,6 +611,11 @@ def main():
         backbone=args.backbone,
         pretrained_model_name_or_path=args.pretrained_model_name_or_path,
     )
+    args.dit = is_dit_checkpoint(args.backbone) or is_dit_checkpoint(args.pretrained_model_name_or_path)
+    if args.dit and args.resolution % 16 != 0:
+        raise ValueError(
+            f"FLUX packing requires --resolution divisible by 16 (VAE 8× and 2×2 pack), got {args.resolution}."
+        )
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError("Cannot use both `--report_to=wandb` and `--hub_token`. Use `hf auth login` instead.")
 
@@ -300,51 +662,98 @@ def main():
     else:
         repo_id = None
 
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
-    )
-    text_encoder = CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=args.revision,
-        variant=args.variant,
-    )
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
-    )
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
-    )
-    if int(unet.config.in_channels) not in (INPAINTING_UNET_IN_CHANNELS, 13):
-        raise ValueError(
-            f"Expected an SD inpainting UNet ({INPAINTING_UNET_IN_CHANNELS} input channels), "
-            f"got in_channels={unet.config.in_channels}. "
-            f"Use --backbone sd15|sd21 or an inpainting Hub id such as {INPAINTING_BACKBONES['sd15']}."
+    if args.dit:
+        FluxTransformer2DModel, FlowMatchEulerDiscreteScheduler, T5EncoderModel, T5TokenizerFast = _import_flux()
+        noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="scheduler"
         )
-    unet = adapt_unigs_unet(unet)
+        tokenizer = CLIPTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
+        )
+        tokenizer_2 = T5TokenizerFast.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="tokenizer_2", revision=args.revision
+        )
+        text_encoder = CLIPTextModel.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="text_encoder",
+            revision=args.revision,
+            variant=args.variant,
+        )
+        text_encoder_2 = T5EncoderModel.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="text_encoder_2",
+            revision=args.revision,
+            variant=args.variant,
+        )
+        vae = AutoencoderKL.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+        )
+        transformer = FluxTransformer2DModel.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="transformer", revision=args.non_ema_revision
+        )
+        transformer = adapt_unigs_transformer(transformer)
+        if args.lora_rank:
+            transformer = _apply_dit_lora(transformer, args.lora_rank, args.lora_alpha)
+        unet = None
+        vae.requires_grad_(False)
+        text_encoder.requires_grad_(False)
+        text_encoder_2.requires_grad_(False)
+        transformer.train()
+    else:
+        tokenizer_2 = None
+        text_encoder_2 = None
+        transformer = None
+        noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+        tokenizer = CLIPTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
+        )
+        text_encoder = CLIPTextModel.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="text_encoder",
+            revision=args.revision,
+            variant=args.variant,
+        )
+        vae = AutoencoderKL.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+        )
+        unet = UNet2DConditionModel.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
+        )
+        if int(unet.config.in_channels) not in (INPAINTING_UNET_IN_CHANNELS, 13):
+            raise ValueError(
+                f"Expected an SD inpainting UNet ({INPAINTING_UNET_IN_CHANNELS} input channels), "
+                f"got in_channels={unet.config.in_channels}. "
+                f"Use --backbone sd15|sd21 or an inpainting Hub id such as {INPAINTING_BACKBONES['sd15']}."
+            )
+        unet = adapt_unigs_unet(unet)
+        vae.requires_grad_(False)
+        text_encoder.requires_grad_(False)
+        unet.train()
 
-    vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-    unet.train()
+    denoise_model = transformer if args.dit else unet
 
     if args.use_ema:
+        if args.dit:
+            raise ValueError("--use_ema is not supported for the FLUX DiT backbone.")
         ema_unet = EMAModel(unet.parameters(), model_cls=UNet2DConditionModel, model_config=unet.config)
 
     if args.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
+        if args.dit:
+            logger.warning("xformers memory-efficient attention is ignored for the FLUX DiT backbone (uses SDPA).")
+        elif is_xformers_available():
             unet.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Install it with `pip install xformers`.")
 
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
+        save_subfolder = "transformer" if args.dit else "unet"
 
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 if args.use_ema:
                     ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
                 for model in models:
-                    model.save_pretrained(os.path.join(output_dir, "unet"))
+                    model.save_pretrained(os.path.join(output_dir, save_subfolder))
                     if weights:
                         weights.pop()
 
@@ -354,9 +763,14 @@ def main():
                 ema_unet.load_state_dict(load_model.state_dict())
                 ema_unet.to(accelerator.device)
                 del load_model
+            if args.dit:
+                flux_cls, _, _, _ = _import_flux()
+                loader = flux_cls
+            else:
+                loader = UNet2DConditionModel
             for _ in range(len(models)):
                 model = models.pop()
-                load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = loader.from_pretrained(input_dir, subfolder=save_subfolder)
                 model.register_to_config(**load_model.config)
                 model.load_state_dict(load_model.state_dict())
                 del load_model
@@ -365,7 +779,7 @@ def main():
         accelerator.register_load_state_pre_hook(load_model_hook)
 
     if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
+        denoise_model.enable_gradient_checkpointing()
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
     if args.scale_lr:
@@ -383,7 +797,7 @@ def main():
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        unet.parameters(),
+        _trainable_parameters(denoise_model),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -417,7 +831,7 @@ def main():
 
     train_dataset = UniGSInstanceDataset(
         records,
-        tokenizer=tokenizer,
+        tokenizer=None if args.dit else tokenizer,
         resolution=args.resolution,
         task=args.task,
         max_entities=args.max_entities,
@@ -449,9 +863,13 @@ def main():
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
+    denoise_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        denoise_model, optimizer, train_dataloader, lr_scheduler
     )
+    if args.dit:
+        transformer = denoise_model
+    else:
+        unet = denoise_model
     if args.use_ema:
         ema_unet.to(accelerator.device)
 
@@ -462,6 +880,8 @@ def main():
         weight_dtype = torch.bfloat16
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
+    if args.dit:
+        text_encoder_2.to(accelerator.device, dtype=weight_dtype)
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -480,7 +900,10 @@ def main():
     logger.info("  Gradient accumulation steps = %s", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %s", args.max_train_steps)
     logger.info("  Backbone = %s", args.pretrained_model_name_or_path)
+    logger.info("  Architecture = %s", "dit-flux-fill (context-token concat)" if args.dit else "unet-channel-concat")
     logger.info("  Task = %s", args.task)
+
+    noise_scheduler_copy = copy.deepcopy(noise_scheduler) if args.dit else noise_scheduler
 
     global_step = 0
     first_epoch = 0
@@ -503,85 +926,42 @@ def main():
     progress_bar.set_description("Steps")
 
     for epoch in range(first_epoch, args.num_train_epochs):
-        unet.train()
+        denoise_model.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(unet):
-                image_latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
-                image_latents = image_latents * vae.config.scaling_factor
-                colormap_latents = vae.encode(batch["colormap_values"].to(weight_dtype)).latent_dist.sample()
-                colormap_latents = colormap_latents * vae.config.scaling_factor
-                latents = torch.cat([image_latents, colormap_latents], dim=1)
-
-                noise = torch.randn_like(latents)
-                if args.noise_offset:
-                    noise = noise + args.noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+            with accelerator.accumulate(denoise_model):
+                if args.dit:
+                    loss = _dit_training_step(
+                        batch=batch,
+                        args=args,
+                        vae=vae,
+                        transformer=transformer,
+                        text_encoder=text_encoder,
+                        text_encoder_2=text_encoder_2,
+                        tokenizer=tokenizer,
+                        tokenizer_2=tokenizer_2,
+                        noise_scheduler=noise_scheduler_copy,
+                        weight_dtype=weight_dtype,
+                        accelerator=accelerator,
                     )
-                bsz = latents.shape[0]
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
-                ).long()
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-                control_latents = vae.encode(batch["control_values"].to(weight_dtype)).latent_dist.mode()
-                control_latents = control_latents * vae.config.scaling_factor
-                coarse_mask = F.interpolate(
-                    batch["coarse_mask"].to(dtype=weight_dtype, device=latents.device),
-                    size=noisy_latents.shape[-2:],
-                    mode="nearest",
-                )
-
-                if args.conditioning_dropout_prob is not None and args.conditioning_dropout_prob > 0:
-                    random_p = torch.rand(bsz, device=latents.device)
-                    prompt_mask = (random_p < args.conditioning_dropout_prob).reshape(bsz, 1, 1)
-                    drop_ids = tokenizer(
-                        [""] * bsz,
-                        max_length=tokenizer.model_max_length,
-                        padding="max_length",
-                        truncation=True,
-                        return_tensors="pt",
-                    ).input_ids.to(latents.device)
-                    null_conditioning = text_encoder(drop_ids)[0]
-                    encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)
-
-                model_input = torch.cat([noisy_latents, coarse_mask, control_latents], dim=1)
-
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                model_pred = unet(model_input, timesteps, encoder_hidden_states, return_dict=False)[0]
-
-                if args.loss_on_mask_only:
-                    loss_mask = coarse_mask.expand_as(model_pred)
-                    loss = F.mse_loss(model_pred.float() * loss_mask, target.float() * loss_mask, reduction="sum")
-                    loss = loss / torch.clamp(loss_mask.sum(), min=1.0)
-                elif args.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                else:
-                    snr = compute_snr(noise_scheduler, timesteps)
-                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-                        dim=1
-                    )[0]
-                    if noise_scheduler.config.prediction_type == "epsilon":
-                        mse_loss_weights = mse_loss_weights / snr
-                    elif noise_scheduler.config.prediction_type == "v_prediction":
-                        mse_loss_weights = mse_loss_weights / (snr + 1)
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
+                    loss = _unet_training_step(
+                        batch=batch,
+                        args=args,
+                        vae=vae,
+                        unet=unet,
+                        text_encoder=text_encoder,
+                        tokenizer=tokenizer,
+                        noise_scheduler=noise_scheduler,
+                        weight_dtype=weight_dtype,
+                    )
 
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    accelerator.clip_grad_norm_(denoise_model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -615,12 +995,17 @@ def main():
                     if args.use_ema:
                         ema_unet.store(unet.parameters())
                         ema_unet.copy_to(unet.parameters())
-                    pipeline = UniGSPipeline(
-                        vae=unwrap_model(accelerator, vae),
-                        text_encoder=unwrap_model(accelerator, text_encoder),
+                    pipeline = _build_validation_pipeline(
+                        args=args,
+                        accelerator=accelerator,
+                        vae=vae,
+                        text_encoder=text_encoder,
+                        text_encoder_2=text_encoder_2,
                         tokenizer=tokenizer,
-                        unet=unwrap_model(accelerator, unet),
-                        scheduler=DDIMScheduler.from_config(noise_scheduler.config),
+                        tokenizer_2=tokenizer_2,
+                        unet=unet,
+                        transformer=transformer,
+                        noise_scheduler=noise_scheduler,
                     )
                     log_validation(pipeline, args, accelerator, weight_dtype, global_step)
                     if args.use_ema:
@@ -635,15 +1020,26 @@ def main():
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unet = unwrap_model(accelerator, unet)
+        denoise_model = unwrap_model(accelerator, denoise_model)
         if args.use_ema:
-            ema_unet.copy_to(unet.parameters())
-        pipeline = UniGSPipeline(
-            vae=unwrap_model(accelerator, vae),
-            text_encoder=unwrap_model(accelerator, text_encoder),
+            ema_unet.copy_to(denoise_model.parameters())
+        if args.dit and args.lora_rank:
+            if hasattr(denoise_model, "fuse_lora"):
+                denoise_model.fuse_lora(lora_scale=1.0)
+            if hasattr(denoise_model, "unload_lora"):
+                denoise_model.unload_lora()
+        pipeline = _build_validation_pipeline(
+            args=args,
+            accelerator=accelerator,
+            vae=vae,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
             tokenizer=tokenizer,
-            unet=unet,
-            scheduler=DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler"),
+            tokenizer_2=tokenizer_2,
+            unet=None if args.dit else denoise_model,
+            transformer=denoise_model if args.dit else None,
+            noise_scheduler=noise_scheduler,
+            final=True,
         )
         pipeline.save_pretrained(args.output_dir)
         if args.push_to_hub:
