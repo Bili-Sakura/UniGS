@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Adapt a Stable Diffusion 1.5 / 2.1 UNet to UniGS 13-in / 8-out channels.
+"""Adapt an SD *inpainting* UNet to UniGS 13-in / 8-out channels.
+
+UniGS is initialized from Stable Diffusion inpainting (9 input channels), as in the
+paper. Base text-to-image checkpoints (4 input channels) are not supported.
 
 UniGS concatenates, in this order (Eq. 8):
 
@@ -22,7 +25,7 @@ UniGS concatenates, in this order (Eq. 8):
     z^c    (4)  control latents (masked image, colormap, or full image)
 
 and predicts 8 channels ``[image, colormap]``. Newly added weights are zeroed
-as in InstructPix2Pix / the UniGS paper ("weight newly added channels as zero").
+as in the UniGS paper ("weight newly added channels as zero").
 """
 
 from __future__ import annotations
@@ -34,12 +37,19 @@ from torch import nn
 
 from diffusers import UNet2DConditionModel
 
+from .backbones import INPAINTING_BACKBONES, INPAINTING_UNET_IN_CHANNELS
+
 
 logger = logging.getLogger(__name__)
 
 UNIGS_IN_CHANNELS = 13
 UNIGS_OUT_CHANNELS = 8
 LATENT_CHANNELS = 4
+
+_INPAINTING_HINT = (
+    "Use an SD inpainting checkpoint such as "
+    f"`{INPAINTING_BACKBONES['sd15']}` or `{INPAINTING_BACKBONES['sd21']}`."
+)
 
 
 def _copy_conv_like(src: nn.Conv2d, dst: nn.Conv2d) -> None:
@@ -51,13 +61,12 @@ def _copy_conv_like(src: nn.Conv2d, dst: nn.Conv2d) -> None:
 
 
 def adapt_unigs_unet(unet: UNet2DConditionModel, zero_init: bool = True) -> UNet2DConditionModel:
-    """Expand ``conv_in`` / ``conv_out`` of an SD 1.5 or SD 2.1 UNet in-place.
+    """Expand an SD inpainting UNet (9-in / 4-out) to UniGS (13-in / 8-out) in-place.
 
-    Supported source checkpoints:
+  Supported source checkpoints:
 
-    * text-to-image (4 in / 4 out) — extra in/out channels are zero-initialized
-    * inpainting (9 in / 4 out) — noisy image, mask, and control channels are
-      copied from the inpainting UNet; colormap channels are zero-initialized
+    * SD inpainting (9 in / 4 out) — noisy image, mask, and control channels are
+      copied into the UniGS layout; colormap channels are zero-initialized
     * already-adapted UniGS (13 in / 8 out) — returned unchanged
     """
     old_in = int(unet.config.in_channels)
@@ -67,17 +76,22 @@ def adapt_unigs_unet(unet: UNet2DConditionModel, zero_init: bool = True) -> UNet
         logger.info("UNet already has UniGS channels (13 in / 8 out).")
         return unet
 
-    if old_in not in (4, 9, UNIGS_IN_CHANNELS):
+    if old_in == 4:
         raise ValueError(
-            f"Unsupported UNet `in_channels={old_in}`. Expected 4 (SD), 9 (SD inpainting), or 13 (UniGS)."
+            f"UniGS does not support base text-to-image UNets (`in_channels={old_in}`). {_INPAINTING_HINT}"
+        )
+    if old_in != INPAINTING_UNET_IN_CHANNELS:
+        raise ValueError(
+            f"Unsupported UNet `in_channels={old_in}`. Expected {INPAINTING_UNET_IN_CHANNELS} "
+            f"(SD inpainting) or {UNIGS_IN_CHANNELS} (UniGS). {_INPAINTING_HINT}"
         )
     if old_out not in (4, UNIGS_OUT_CHANNELS):
         raise ValueError(
-            f"Unsupported UNet `out_channels={old_out}`. Expected 4 (SD) or 8 (UniGS)."
+            f"Unsupported UNet `out_channels={old_out}`. Expected 4 (SD inpainting) or 8 (UniGS)."
         )
 
     logger.info(
-        "Adapting UNet from %s-in/%s-out to UniGS %s-in/%s-out (zero-init extra channels=%s).",
+        "Adapting inpainting UNet from %s-in/%s-out to UniGS %s-in/%s-out (zero-init extra channels=%s).",
         old_in,
         old_out,
         UNIGS_IN_CHANNELS,
@@ -98,16 +112,14 @@ def adapt_unigs_unet(unet: UNet2DConditionModel, zero_init: bool = True) -> UNet
         new_conv_in = new_conv_in.to(device=conv_in.weight.device, dtype=conv_in.weight.dtype)
         with torch.no_grad():
             _copy_conv_like(conv_in, new_conv_in)
-            # [0:4] noisy image latents — always present.
-            copy_in = min(old_in, LATENT_CHANNELS)
-            new_conv_in.weight[:, :copy_in].copy_(conv_in.weight[:, :copy_in])
-            if old_in == 9:
-                # SD inpainting layout: [noisy(4), mask(1), masked_image(4)]
-                # UniGS layout:         [noisy_img(4), noisy_cmap(4), mask(1), control(4)]
-                new_conv_in.weight[:, 8:9].copy_(conv_in.weight[:, 4:5])
-                new_conv_in.weight[:, 9:13].copy_(conv_in.weight[:, 5:9])
-            elif not zero_init:
-                nn.init.kaiming_normal_(new_conv_in.weight[:, copy_in:])
+            # SD inpainting layout: [noisy(4), mask(1), masked_image(4)]
+            # UniGS layout:         [noisy_img(4), noisy_cmap(4), mask(1), control(4)]
+            new_conv_in.weight[:, :LATENT_CHANNELS].copy_(conv_in.weight[:, :LATENT_CHANNELS])
+            new_conv_in.weight[:, 8:9].copy_(conv_in.weight[:, 4:5])
+            new_conv_in.weight[:, 9:13].copy_(conv_in.weight[:, 5:9])
+            if not zero_init:
+                nn.init.kaiming_normal_(new_conv_in.weight[:, LATENT_CHANNELS:8])
+                nn.init.kaiming_normal_(new_conv_in.weight[:, 9:13])
         unet.conv_in = new_conv_in
         unet.register_to_config(in_channels=UNIGS_IN_CHANNELS)
 

@@ -1,6 +1,6 @@
 # UniGS
 
-Unofficial implementation of [UniGS: Unified Representation for Image Generation and Segmentation](https://arxiv.org/abs/2312.01985) on **Stable Diffusion 1.5 / 2.1**, written in native 🤗 Diffusers style so it can be dropped into `examples/research_projects/unigs` (training) and `examples/community` (inference) with almost no changes.
+Unofficial implementation of [UniGS: Unified Representation for Image Generation and Segmentation](https://arxiv.org/abs/2312.01985) on **Stable Diffusion inpainting** backbones (SD 1.5 / 2.1), written in native 🤗 Diffusers style so it can be dropped into `examples/research_projects/unigs` (training) and `examples/community` (inference) with almost no changes.
 
 UniGS treats entity-level masks as an RGB **colormap** that lives in the same VAE latent space as images. A dual-output UNet denoises both jointly inside an inpainting protocol, which is enough to cover four tasks from one representation:
 
@@ -11,12 +11,14 @@ UniGS treats entity-level masks as an RGB **colormap** that lives in the same VA
 | Referring segmentation | `Ω(M)` | VAE of the full image | `referring: find dog.` |
 | Entity segmentation | all ones | VAE of the full image | `panoptic: all entities.` |
 
-The UNet is the standard SD 1.5 / 2.1 `UNet2DConditionModel` with extra channels only:
+The UNet starts from the standard SD **inpainting** `UNet2DConditionModel` (9 input channels) and is expanded to UniGS channels only:
 
 * **13 in:** `concat(z_t^image, z_t^colormap, coarse_mask, z_control)` (Eq. 8)
 * **8 out:** `concat(eps_image, eps_colormap)`
 
-Newly added `conv_in` / `conv_out` weights are zero-initialized, matching InstructPix2Pix and the paper. When the backbone is an SD *inpainting* checkpoint, the noisy-image, mask, and control channels are copied across.
+Newly added `conv_in` / `conv_out` weights are zero-initialized. Existing inpainting channels (noisy image, mask, control latent) are copied from the pretrained UNet; colormap channels are zero-initialized — matching the paper.
+
+Base text-to-image checkpoints (`stable-diffusion-v1-5`, `stable-diffusion-2-1`, etc.) are **not** supported.
 
 ## Layout
 
@@ -29,7 +31,8 @@ src/
   requirements.txt
   unigs/
     pipeline_unigs.py         # DiffusionPipeline (community-pipeline style)
-    unet.py                   # 4/9 → 13-in, 4 → 8-out adapter
+    backbones.py              # sd15 / sd21 inpainting Hub ids
+    unet.py                   # 9 → 13-in, 4 → 8-out adapter
     colormap.py               # location-aware palette Ψ + progressive dichotomy Φ
     coarse_mask.py            # Ω, Bezier / extended-bbox coarse masks
     prompts.py                # Table 2 templates
@@ -42,11 +45,12 @@ src/
 pip install -r src/requirements.txt
 ```
 
-Backbone checkpoints (either works; they share the same UNet layout):
+Supported inpainting backbones (use `--backbone` or pass the Hub id explicitly):
 
-* SD 1.5 inpainting (paper default): `stable-diffusion-v1-5/stable-diffusion-inpainting`
-* SD 1.5: `stable-diffusion-v1-5/stable-diffusion-v1-5`
-* SD 2.1: `stabilityai/stable-diffusion-2-1` or `stabilityai/stable-diffusion-2-inpainting`
+| Shorthand | Checkpoint |
+| --- | --- |
+| `sd15` (paper default) | `stable-diffusion-v1-5/stable-diffusion-inpainting` |
+| `sd21` | `stabilityai/stable-diffusion-2-inpainting` |
 
 ## Training
 
@@ -56,7 +60,7 @@ COCO instances (paper setting: sample up to 4 entities, 512², 48 epochs):
 
 ```bash
 accelerate launch src/train_unigs.py \
-  --pretrained_model_name_or_path=stable-diffusion-v1-5/stable-diffusion-inpainting \
+  --backbone=sd15 \
   --coco_image_dir=/data/coco/train2017 \
   --coco_annotation_file=/data/coco/annotations/instances_train2017.json \
   --output_dir=unigs-sd15 \
@@ -73,11 +77,11 @@ accelerate launch src/train_unigs.py \
   --conditioning_dropout_prob=0.1
 ```
 
-A 🤗 Datasets object with instance masks also works:
+SD 2.1 inpainting:
 
 ```bash
 accelerate launch src/train_unigs.py \
-  --pretrained_model_name_or_path=stabilityai/stable-diffusion-2-1 \
+  --backbone=sd21 \
   --dataset_name=<your/dataset> \
   --image_column=image \
   --mask_column=masks \
@@ -111,6 +115,15 @@ out.colormaps[0].save("colormap.png")
 # out.masks is a list of binary entity maps from the progressive dichotomy module
 ```
 
+Bootstrap directly from an inpainting checkpoint (channels expanded; weights are pretrained-inpainting + zero-init colormap branches — fine-tune before serious use):
+
+```python
+from unigs import UniGSPipeline
+
+pipe = UniGSPipeline.from_inpainting(backbone="sd15", torch_dtype=torch.float16)
+# or: UniGSPipeline.from_inpainting("stabilityai/stable-diffusion-2-inpainting")
+```
+
 The other Table-2 tasks:
 
 ```python
@@ -119,20 +132,11 @@ out = pipe.referring("dog", image=image, mask_image=region)
 out = pipe.segment(image)  # entity / panoptic
 ```
 
-Or from a raw SD checkpoint (channels are expanded; this is untrained UniGS, useful only as a smoke test):
-
-```python
-pipe = UniGSPipeline.from_stable_diffusion(
-    "stable-diffusion-v1-5/stable-diffusion-inpainting",
-    torch_dtype=torch.float16,
-)
-```
-
 CLI:
 
 ```bash
 python src/infer_unigs.py \
-  --pretrained-model unigs-sd15 \
+  --backbone sd15 \
   --task inpainting \
   --prompt dog \
   --image scene.png \
@@ -146,9 +150,9 @@ python src/infer_unigs.py \
 
 **Progressive dichotomy (Φ).** Depth-first 2-means on concatenated RGB + CIE Lab features, no assumed cluster count. A region stops splitting when the mean L2 distance to its centroid is below `δ` (default `10`). Entity segmentation keeps every cluster, including near-black regions.
 
-**Coarse mask (Ω).** With probability `--arbitrary_mask_prob` a quadratic-Bezier blob is drawn around the entity bbox (Paint-by-Example / supplementary Alg. 1); otherwise an expanded rectangle is used. Synthesis and entity segmentation pass an all-ones mask.
+**Coarse mask (Ω).** With probability `--arbitrary_mask_prob` a quadratic-Bezier blob is drawn around the entity bbox (Paint-by-Example / supplementary Alg. 1); otherwise an extended rectangle is used. Synthesis and entity segmentation pass an all-ones mask.
 
-**VAE.** Colormaps are encoded and decoded with the same `AutoencoderKL` as RGB images. The paper writes a 4× latent stride; SD 1.5 / 2.1 actually use 8× (`vae_scale_factor`), and this code follows the real backbone.
+**VAE.** Colormaps are encoded and decoded with the same `AutoencoderKL` as RGB images. SD inpainting uses an 8× VAE downscale (`vae_scale_factor`).
 
 ## Mapping onto Diffusers
 

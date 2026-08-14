@@ -20,7 +20,7 @@ Examples:
     python src/infer_unigs.py --task inpainting --prompt "dog" \\
         --image input.png --mask mask.png --output-dir out
 
-    python src/infer_unigs.py --task entity --image scene.png --output-dir out
+    python src/infer_unigs.py --backbone sd21 --task entity --image scene.png
 
     python src/infer_unigs.py --pretrained-model path/to/trained-unigs \\
         --task synthesis --prompt "cat, sofa and lamp" --colormap layout.png
@@ -37,7 +37,8 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from unigs import UniGSPipeline, adapt_unigs_unet
+from unigs import UniGSPipeline, adapt_unigs_unet, resolve_inpainting_checkpoint
+from unigs.backbones import INPAINTING_BACKBONES
 from unigs.colormap import ProgressiveDichotomyModule
 from unigs.prompts import TASK_NAMES
 
@@ -45,10 +46,17 @@ from unigs.prompts import TASK_NAMES
 def parse_args():
     parser = argparse.ArgumentParser(description="UniGS inference.")
     parser.add_argument(
+        "--backbone",
+        type=str,
+        default="sd15",
+        choices=list(INPAINTING_BACKBONES),
+        help="SD inpainting checkpoint when bootstrapping from the Hub (ignored for trained UniGS dirs).",
+    )
+    parser.add_argument(
         "--pretrained-model",
         type=str,
-        default="stable-diffusion-v1-5/stable-diffusion-inpainting",
-        help="Trained UniGS dir, or an SD 1.5 / 2.1 checkpoint to adapt on the fly.",
+        default=None,
+        help="Trained UniGS output dir, or an SD inpainting Hub id / local path.",
     )
     parser.add_argument("--task", type=str, default="inpainting", choices=list(TASK_NAMES))
     parser.add_argument("--prompt", type=str, default=None)
@@ -60,9 +68,17 @@ def parse_args():
     parser.add_argument("--guidance-scale", type=float, default=7.5)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--pdm-delta", type=float, default=10.0)
-    parser.add_argument("--from-stable-diffusion", action="store_true", help="Expand SD conv_in/conv_out to 13/8.")
+    parser.add_argument(
+        "--from-inpainting",
+        action="store_true",
+        help="Load and adapt an SD inpainting checkpoint instead of a trained UniGS directory.",
+    )
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp32", "fp16", "bf16"])
     return parser.parse_args()
+
+
+def _is_trained_unigs_dir(path: str) -> bool:
+    return os.path.isdir(path) and os.path.isdir(os.path.join(path, "unet"))
 
 
 def main():
@@ -71,12 +87,17 @@ def main():
     dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    if args.from_stable_diffusion:
-        pipeline = UniGSPipeline.from_stable_diffusion(args.pretrained_model, torch_dtype=dtype)
-    else:
+    if args.pretrained_model and _is_trained_unigs_dir(args.pretrained_model) and not args.from_inpainting:
         pipeline = UniGSPipeline.from_pretrained(args.pretrained_model, torch_dtype=dtype)
         if getattr(pipeline.unet.config, "in_channels", None) != 13:
             pipeline.unet = adapt_unigs_unet(pipeline.unet)
+    else:
+        checkpoint = resolve_inpainting_checkpoint(
+            backbone=args.backbone,
+            pretrained_model_name_or_path=args.pretrained_model,
+        )
+        pipeline = UniGSPipeline.from_inpainting(checkpoint, backbone=args.backbone, torch_dtype=dtype)
+
     pipeline = pipeline.to(device)
     pipeline.pdm = ProgressiveDichotomyModule(delta=args.pdm_delta, include_background=args.task == "entity")
 

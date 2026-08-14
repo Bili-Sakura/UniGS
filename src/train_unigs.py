@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fine-tune Stable Diffusion 1.5 / 2.1 as UniGS with 🤗 Accelerate.
+"""Fine-tune Stable Diffusion inpainting backbones as UniGS with 🤗 Accelerate.
 
 Example:
     accelerate launch src/train_unigs.py \\
-        --pretrained_model_name_or_path=stable-diffusion-v1-5/stable-diffusion-inpainting \\
+        --backbone=sd15 \\
         --coco_image_dir=/data/coco/train2017 \\
         --coco_annotation_file=/data/coco/annotations/instances_train2017.json \\
         --output_dir=unigs-sd15 \\
@@ -62,6 +62,7 @@ from diffusers.utils.torch_utils import is_compiled_module
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from unigs.backbones import INPAINTING_BACKBONES, INPAINTING_UNET_IN_CHANNELS, resolve_inpainting_checkpoint
 from unigs.dataset import UniGSInstanceDataset, collate_fn, load_coco_records, records_from_hf_dataset
 from unigs.pipeline_unigs import UniGSPipeline
 from unigs.prompts import TASK_NAMES, TASK_PROMPT_TEMPLATES
@@ -80,12 +81,23 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train UniGS on Stable Diffusion 1.5 / 2.1.")
+    parser = argparse.ArgumentParser(description="Train UniGS on an SD inpainting backbone.")
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="sd15",
+        choices=list(INPAINTING_BACKBONES),
+        help="Inpainting checkpoint shorthand when --pretrained_model_name_or_path is omitted.",
+    )
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="stable-diffusion-v1-5/stable-diffusion-inpainting",
-        help="SD 1.5, SD 2.1, or the matching inpainting checkpoint.",
+        default=None,
+        help=(
+            "Hub id or local path to an SD *inpainting* checkpoint "
+            f"({INPAINTING_BACKBONES['sd15']} or {INPAINTING_BACKBONES['sd21']}). "
+            "Overrides --backbone when set."
+        ),
     )
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--variant", type=str, default=None)
@@ -238,6 +250,10 @@ def log_validation(pipeline, args, accelerator, weight_dtype, step):
 
 def main():
     args = parse_args()
+    args.pretrained_model_name_or_path = resolve_inpainting_checkpoint(
+        backbone=args.backbone,
+        pretrained_model_name_or_path=args.pretrained_model_name_or_path,
+    )
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError("Cannot use both `--report_to=wandb` and `--hub_token`. Use `hf auth login` instead.")
 
@@ -300,6 +316,12 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     )
+    if int(unet.config.in_channels) not in (INPAINTING_UNET_IN_CHANNELS, 13):
+        raise ValueError(
+            f"Expected an SD inpainting UNet ({INPAINTING_UNET_IN_CHANNELS} input channels), "
+            f"got in_channels={unet.config.in_channels}. "
+            f"Use --backbone sd15|sd21 or an inpainting Hub id such as {INPAINTING_BACKBONES['sd15']}."
+        )
     unet = adapt_unigs_unet(unet)
 
     vae.requires_grad_(False)

@@ -22,6 +22,12 @@ dropped into `examples/research_projects/unigs` (training) and
 Paper: https://arxiv.org/abs/2312.01985
 """
 
+from .backbones import (
+    DEFAULT_BACKBONE,
+    INPAINTING_BACKBONES,
+    INPAINTING_UNET_IN_CHANNELS,
+    resolve_inpainting_checkpoint,
+)
 from .coarse_mask import CoarseMaskGenerator
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .dataset import UniGSInstanceDataset, collate_fn
@@ -31,6 +37,9 @@ from .unet import UNIGS_IN_CHANNELS, UNIGS_OUT_CHANNELS, adapt_unigs_unet
 
 __all__ = [
     "CoarseMaskGenerator",
+    "DEFAULT_BACKBONE",
+    "INPAINTING_BACKBONES",
+    "INPAINTING_UNET_IN_CHANNELS",
     "LocationAwarePalette",
     "ProgressiveDichotomyModule",
     "UniGSInstanceDataset",
@@ -42,4 +51,5 @@ __all__ = [
     "adapt_unigs_unet",
     "build_task_prompt",
     "collate_fn",
+    "resolve_inpainting_checkpoint",
 ]

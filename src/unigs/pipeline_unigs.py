@@ -52,6 +52,7 @@ try:
 except ImportError:
     KarrasDiffusionSchedulers = object
 
+from .backbones import INPAINTING_BACKBONES, resolve_inpainting_checkpoint
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .prompts import TASK_PROMPT_TEMPLATES, build_task_prompt
 from .unet import UNIGS_IN_CHANNELS, UNIGS_OUT_CHANNELS, adapt_unigs_unet
@@ -177,7 +178,8 @@ class UniGSPipeline(DiffusionPipeline, StableDiffusionMixin):
         vae ([`AutoencoderKL`]):
             Variational Auto-Encoder used to encode and decode images *and* colormaps.
         text_encoder ([`CLIPTextModel`]):
-            Frozen CLIP text encoder (SD 1.5 OpenAI CLIP or SD 2.1 OpenCLIP).
+            Frozen CLIP text encoder from the inpainting checkpoint (SD 1.5 OpenAI CLIP
+            or SD 2.1 OpenCLIP).
         tokenizer ([`CLIPTokenizer`]):
             Tokenizer associated with `text_encoder`.
         unet ([`UNet2DConditionModel`]):
@@ -213,7 +215,7 @@ class UniGSPipeline(DiffusionPipeline, StableDiffusionMixin):
             if in_ch != UNIGS_IN_CHANNELS or out_ch != UNIGS_OUT_CHANNELS:
                 logger.warning(
                     "UniGS expects a UNet with in_channels=%s and out_channels=%s, got %s / %s. "
-                    "Call `adapt_unigs_unet(unet)` (or `UniGSPipeline.from_stable_diffusion`) before inference.",
+                    "Call `adapt_unigs_unet(unet)` (or `UniGSPipeline.from_inpainting`) before inference.",
                     UNIGS_IN_CHANNELS,
                     UNIGS_OUT_CHANNELS,
                     in_ch,
@@ -242,16 +244,30 @@ class UniGSPipeline(DiffusionPipeline, StableDiffusionMixin):
         self.pdm = ProgressiveDichotomyModule()
 
     @classmethod
-    def from_stable_diffusion(
+    def from_inpainting(
         cls,
-        pretrained_model_name_or_path: str,
+        pretrained_model_name_or_path: Optional[str] = None,
+        backbone: str = "sd15",
         torch_dtype: Optional[torch.dtype] = None,
         revision: Optional[str] = None,
         variant: Optional[str] = None,
         scheduler=None,
         **kwargs,
     ) -> "UniGSPipeline":
-        """Load an SD 1.5 / SD 2.1 (or inpainting) checkpoint and expand it to UniGS channels."""
+        """Load an SD inpainting checkpoint and expand its UNet to UniGS channels.
+
+        Args:
+            pretrained_model_name_or_path:
+                Hub id or local path to an SD *inpainting* pipeline. When omitted,
+                `backbone` selects the default checkpoint (`sd15` or `sd21`).
+            backbone:
+                Shorthand for `stable-diffusion-v1-5/stable-diffusion-inpainting`
+                (`sd15`) or `stabilityai/stable-diffusion-2-inpainting` (`sd21`).
+        """
+        pretrained_model_name_or_path = resolve_inpainting_checkpoint(
+            backbone=backbone,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+        )
         tokenizer = CLIPTokenizer.from_pretrained(
             pretrained_model_name_or_path, subfolder="tokenizer", revision=revision
         )
@@ -289,6 +305,11 @@ class UniGSPipeline(DiffusionPipeline, StableDiffusionMixin):
             scheduler=scheduler,
             **kwargs,
         )
+
+    @classmethod
+    def from_stable_diffusion(cls, pretrained_model_name_or_path: str, **kwargs) -> "UniGSPipeline":
+        """Deprecated alias for :meth:`from_inpainting`. The path must be an SD inpainting checkpoint."""
+        return cls.from_inpainting(pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs)
 
     def encode_prompt(
         self,
