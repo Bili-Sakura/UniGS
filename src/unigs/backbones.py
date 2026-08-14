@@ -95,7 +95,6 @@ DIT_FLOW_FAMILIES = frozenset({"flux", "sd3", "z_image"})
 DIT_EPSILON_FAMILIES = frozenset({"pixart"})
 
 BACKBONES = {**UNET_BACKBONES, **DIT_BACKBONES}
-INPAINTING_BACKBONES = BACKBONES  # backward-compatible alias
 
 DEFAULT_BACKBONE = "sd15"
 INPAINTING_UNET_IN_CHANNELS = 9
@@ -263,14 +262,3 @@ def resolve_backbone(
             "or pass an explicit `--pretrained_model_name_or_path`."
         )
     return BACKBONES[backbone]
-
-
-def resolve_inpainting_checkpoint(
-    backbone: str = DEFAULT_BACKBONE,
-    pretrained_model_name_or_path: Optional[str] = None,
-) -> str:
-    """Backward-compatible alias for :func:`resolve_backbone`."""
-    return resolve_backbone(
-        backbone=backbone,
-        pretrained_model_name_or_path=pretrained_model_name_or_path,
-    )

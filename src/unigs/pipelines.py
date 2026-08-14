@@ -12,13 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-model UniGS pipeline classes (no shared `backbone=` factory)."""
+"""Resolve the UniGS pipeline class, then load with `from_pretrained`."""
 
 from __future__ import annotations
 
 import json
 import os
 from typing import Optional
+
+
+_CLASS_NAMES = {
+    "UniGSPipeline": "sd15",
+    "UniGSFluxPipeline": "flux",
+    "UniGSSD3Pipeline": "sd3",
+    "UniGSZImagePipeline": "z_image",
+    "UniGSPixArtPipeline": "pixart",
+}
 
 
 def pipeline_class_for_family(family: Optional[str]):
@@ -44,51 +53,32 @@ def pipeline_class_for_family(family: Optional[str]):
     return UniGSPipeline
 
 
-def load_base_pipeline(family: Optional[str], pretrained_model_name_or_path: Optional[str] = None, **kwargs):
-    """Adapt a Hub checkpoint into the matching UniGS pipeline (no `backbone` arg)."""
-    if family == "flux":
-        from .pipeline_unigs_flux import UniGSFluxPipeline
-
-        return UniGSFluxPipeline.from_fill(pretrained_model_name_or_path, **kwargs)
-    if family == "sd3":
-        from .pipeline_unigs_sd3 import UniGSSD3Pipeline
-
-        return UniGSSD3Pipeline.from_sd3(pretrained_model_name_or_path, **kwargs)
-    if family == "z_image":
-        from .pipeline_unigs_zimage import UniGSZImagePipeline
-
-        return UniGSZImagePipeline.from_zimage(pretrained_model_name_or_path, **kwargs)
-    if family == "pixart":
-        from .pipeline_unigs_pixart import UniGSPixArtPipeline
-
-        return UniGSPixArtPipeline.from_pixart(pretrained_model_name_or_path, **kwargs)
-    from .pipeline_unigs import UniGSPipeline
-
-    return UniGSPipeline.from_inpainting(pretrained_model_name_or_path, **kwargs)
-
-
-def load_saved_unigs_pipeline(path: str, **kwargs):
-    """Load a `save_pretrained` UniGS dir by `model_index.json` `_class_name`."""
+def _class_name_from_index(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
     index_path = os.path.join(path, "model_index.json")
-    class_name = "UniGSPipeline"
-    family = None
-    if os.path.isfile(index_path):
+    if not os.path.isfile(index_path):
+        return None
+    try:
         with open(index_path, encoding="utf-8") as handle:
-            index = json.load(handle)
-        class_name = index.get("_class_name", class_name)
-        family = index.get("unigs_dit_family")
-    mapping = {
-        "UniGSPipeline": "sd15",
-        "UniGSFluxPipeline": "flux",
-        "UniGSSD3Pipeline": "sd3",
-        "UniGSZImagePipeline": "z_image",
-        "UniGSPixArtPipeline": "pixart",
-        "UniGSDiTPipeline": family,  # legacy combined DiT pipeline
-    }
-    family = mapping.get(class_name, family)
-    if class_name == "UniGSDiTPipeline" and not family:
+            return json.load(handle).get("_class_name")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def pipeline_class_from_pretrained(pretrained_model_name_or_path: Optional[str], family: Optional[str] = None):
+    """Pick the UniGS class from a save dir's `_class_name`, else from `family`."""
+    class_name = _class_name_from_index(pretrained_model_name_or_path)
+    if class_name in _CLASS_NAMES:
+        return pipeline_class_for_family(_CLASS_NAMES[class_name])
+    if family is None:
         from .backbones import detect_dit_family_from_path
 
-        family = detect_dit_family_from_path(path)
-    cls = pipeline_class_for_family(family)
-    return cls.from_pretrained(path, **kwargs)
+        family = detect_dit_family_from_path(pretrained_model_name_or_path)
+    return pipeline_class_for_family(family)
+
+
+def load_unigs_pipeline(pretrained_model_name_or_path: str, family: Optional[str] = None, **kwargs):
+    """`Cls.from_pretrained(...)` for the matching UniGS pipeline class."""
+    cls = pipeline_class_from_pretrained(pretrained_model_name_or_path, family=family)
+    return cls.from_pretrained(pretrained_model_name_or_path, **kwargs)

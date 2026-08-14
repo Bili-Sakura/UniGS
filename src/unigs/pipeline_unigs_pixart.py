@@ -19,7 +19,6 @@ from __future__ import annotations
 from typing import Callable, List, Optional, Union
 
 import torch
-from transformers import T5EncoderModel, T5Tokenizer, T5TokenizerFast
 
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL
@@ -30,12 +29,7 @@ try:
 except ImportError:
     from diffusers import DiffusionPipeline
 
-from .backbones import (
-    PIXART_1024_CHECKPOINT,
-    PIXART_CHECKPOINT,
-    default_dit_guidance,
-    default_dit_max_sequence_length,
-)
+from .backbones import default_dit_guidance, default_dit_max_sequence_length
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .dit import encode_pixart_prompt, forward_pixart_token_concat, pixart_added_cond_kwargs
 from .pipeline_unigs import PipelineImageInput, UniGSPipelineOutput, _as_mask_tensor, _as_pil_rgb, retrieve_timesteps
@@ -50,8 +44,6 @@ from .transformer import adapt_unigs_transformer
 
 
 logger = logging.get_logger(__name__)
-
-DEFAULT_PIXART_CHECKPOINT = PIXART_CHECKPOINT
 
 
 def _import_pixart():
@@ -114,52 +106,13 @@ class UniGSPixArtPipeline(DiffusionPipeline):
         self.pdm = ProgressiveDichotomyModule()
 
     @classmethod
-    def from_pixart(
-        cls,
-        pretrained_model_name_or_path: Optional[str] = None,
-        torch_dtype: Optional[torch.dtype] = None,
-        revision: Optional[str] = None,
-        variant: Optional[str] = None,
-        scheduler=None,
-        **kwargs,
-    ) -> "UniGSPixArtPipeline":
-        """Load PixArt-α and adapt it to UniGS context-token concat."""
-        PixArtTransformer2DModel, DPMSolverMultistepScheduler = _import_pixart()
-        pretrained_model_name_or_path = pretrained_model_name_or_path or DEFAULT_PIXART_CHECKPOINT
-        load_kw = dict(revision=revision, variant=variant, torch_dtype=torch_dtype)
-        vae = AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae", **load_kw)
-        transformer = PixArtTransformer2DModel.from_pretrained(
-            pretrained_model_name_or_path, subfolder="transformer", **load_kw
-        )
-        transformer = adapt_unigs_transformer(transformer, family="pixart")
-        try:
-            tokenizer = T5Tokenizer.from_pretrained(
-                pretrained_model_name_or_path, subfolder="tokenizer", revision=revision
-            )
-        except Exception:
-            tokenizer = T5TokenizerFast.from_pretrained(
-                pretrained_model_name_or_path, subfolder="tokenizer", revision=revision
-            )
-        text_encoder = T5EncoderModel.from_pretrained(
-            pretrained_model_name_or_path, subfolder="text_encoder", **load_kw
-        )
-        if scheduler is None:
-            scheduler = DPMSolverMultistepScheduler.from_pretrained(
-                pretrained_model_name_or_path, subfolder="scheduler"
-            )
-        return cls(
-            vae=vae,
-            transformer=transformer,
-            tokenizer=tokenizer,
-            text_encoder=text_encoder,
-            scheduler=scheduler,
-            **kwargs,
-        )
-
-    @classmethod
-    def from_pixart_1024(cls, **kwargs) -> "UniGSPixArtPipeline":
-        """Load `PixArt-alpha/PixArt-XL-2-1024-MS` as UniGS."""
-        return cls.from_pixart(PIXART_1024_CHECKPOINT, **kwargs)
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load a UniGS PixArt-α pipeline or adapt a base PixArt-α checkpoint."""
+        _import_pixart()
+        pipeline = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        if getattr(pipeline, "transformer", None) is not None:
+            pipeline.transformer = adapt_unigs_transformer(pipeline.transformer, family="pixart")
+        return pipeline
 
     def encode_prompt(
         self,

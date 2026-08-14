@@ -28,13 +28,11 @@ from .backbones import (
     DIT_BACKBONES,
     DIT_FAMILY_CHECKPOINTS,
     FLUX_FILL_CHECKPOINT,
-    INPAINTING_BACKBONES,
     INPAINTING_UNET_IN_CHANNELS,
     UNET_BACKBONES,
     is_dit_checkpoint,
     resolve_backbone,
     resolve_dit_family,
-    resolve_inpainting_checkpoint,
 )
 from .coarse_mask import CoarseMaskGenerator
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
@@ -73,7 +71,6 @@ __all__ = [
     "DIT_BACKBONES",
     "DIT_FAMILY_CHECKPOINTS",
     "FLUX_FILL_CHECKPOINT",
-    "INPAINTING_BACKBONES",
     "INPAINTING_UNET_IN_CHANNELS",
     "LocationAwarePalette",
     "ProgressiveDichotomyModule",
@@ -98,5 +95,4 @@ __all__ = [
     "pack_latents",
     "resolve_backbone",
     "resolve_dit_family",
-    "resolve_inpainting_checkpoint",
 ]

@@ -82,13 +82,13 @@ from diffusers.utils.torch_utils import is_compiled_module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from unigs.backbones import (
-    INPAINTING_BACKBONES,
+    BACKBONES,
     INPAINTING_UNET_IN_CHANNELS,
     default_dit_max_sequence_length,
     dit_uses_flow_matching,
     is_dit_checkpoint,
+    resolve_backbone,
     resolve_dit_family,
-    resolve_inpainting_checkpoint,
 )
 from unigs.dataset import UniGSInstanceDataset, collate_fn, load_coco_records, records_from_hf_dataset
 from unigs.pipeline_unigs import UniGSPipeline
@@ -133,7 +133,7 @@ def parse_args():
         "--backbone",
         type=str,
         default="sd15",
-        choices=list(INPAINTING_BACKBONES),
+        choices=list(BACKBONES),
         help=(
             "Checkpoint shorthand when --pretrained_model_name_or_path is omitted "
             "(`sd15`, `sd21`, `flux`, `sd3`, `z_image`, `pixart`)."
@@ -145,13 +145,13 @@ def parse_args():
         default=None,
         help=(
             "Hub id or local path. UNet inpainting: "
-            f"{INPAINTING_BACKBONES['sd15']} / {INPAINTING_BACKBONES['sd21']}. "
+            f"{BACKBONES['sd15']} / {BACKBONES['sd21']}. "
             "DiT: FLUX uses Fill-style channel concat; sd3 / z_image / pixart use "
             "context-token concat. "
-            f"flux={INPAINTING_BACKBONES['flux']}, "
-            f"sd3={INPAINTING_BACKBONES['sd3']}, "
-            f"z_image={INPAINTING_BACKBONES['z_image']}, "
-            f"pixart={INPAINTING_BACKBONES['pixart']}. "
+            f"flux={BACKBONES['flux']}, "
+            f"sd3={BACKBONES['sd3']}, "
+            f"z_image={BACKBONES['z_image']}, "
+            f"pixart={BACKBONES['pixart']}. "
             "Overrides --backbone when set."
         ),
     )
@@ -996,7 +996,7 @@ def log_validation(pipeline, args, accelerator, weight_dtype, step):
 
 def main():
     args = parse_args()
-    args.pretrained_model_name_or_path = resolve_inpainting_checkpoint(
+    args.pretrained_model_name_or_path = resolve_backbone(
         backbone=args.backbone,
         pretrained_model_name_or_path=args.pretrained_model_name_or_path,
     )
@@ -1232,7 +1232,7 @@ def main():
             raise ValueError(
                 f"Expected an SD inpainting UNet ({INPAINTING_UNET_IN_CHANNELS} input channels), "
                 f"got in_channels={unet.config.in_channels}. "
-                f"Use --backbone sd15|sd21 or an inpainting Hub id such as {INPAINTING_BACKBONES['sd15']}."
+                f"Use --backbone sd15|sd21 or an inpainting Hub id such as {BACKBONES['sd15']}."
             )
         unet = adapt_unigs_unet(unet)
         vae.requires_grad_(False)

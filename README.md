@@ -55,7 +55,7 @@ src/
     pipeline_unigs_zimage.py  # UniGSZImagePipeline (omni context tokens)
     pipeline_unigs_pixart.py  # UniGSPixArtPipeline (context-token concat)
     pipeline_unigs_common.py  # shared task / latent helpers
-    pipelines.py              # load by family or saved `_class_name`
+    pipelines.py              # pick class from `_class_name` / family, then from_pretrained
     backbones.py              # train/infer Hub-id shorthands
     unet.py                   # 9 → 13-in, 4 → 8-out adapter
     transformer.py            # Fill 384-in → UniGS 448-in channel-concat adapter
@@ -74,7 +74,7 @@ tests/
 pip install -r src/requirements.txt
 ```
 
-Each model family has its own pipeline class and factory (no `backbone=` argument on the pipeline). Training `--backbone` is only a Hub-id shorthand:
+Each model family has its own pipeline class loaded with Diffusers `from_pretrained`. Training `--backbone` is only a Hub-id shorthand:
 
 | Shorthand | Checkpoint | Conditioning |
 | --- | --- | --- |
@@ -225,7 +225,7 @@ out.colormaps[0].save("colormap.png")
 # out.masks is a list of binary entity maps from the progressive dichotomy module
 ```
 
-Bootstrap from a base Hub checkpoint (channels / adapters expanded; fine-tune before serious use). Each family has its own class — there is no `backbone=` pipeline argument:
+Bootstrap from a base Hub checkpoint (adapters applied inside `from_pretrained`; fine-tune before serious use):
 
 ```python
 from unigs import (
@@ -236,15 +236,22 @@ from unigs import (
     UniGSZImagePipeline,
 )
 
-pipe = UniGSPipeline.from_sd15(torch_dtype=torch.float16)
-pipe = UniGSPipeline.from_sd21(torch_dtype=torch.float16)
-# or: UniGSPipeline.from_inpainting("stabilityai/stable-diffusion-2-inpainting")
-
-pipe = UniGSFluxPipeline.from_fill(torch_dtype=torch.bfloat16)
-pipe = UniGSSD3Pipeline.from_sd3(torch_dtype=torch.bfloat16)
-pipe = UniGSZImagePipeline.from_zimage(torch_dtype=torch.bfloat16)
-pipe = UniGSPixArtPipeline.from_pixart(torch_dtype=torch.float16)
-# PixArt 1024: UniGSPixArtPipeline.from_pixart("PixArt-alpha/PixArt-XL-2-1024-MS")
+pipe = UniGSPipeline.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-inpainting", torch_dtype=torch.float16
+)
+pipe = UniGSPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-2-inpainting", torch_dtype=torch.float16
+)
+pipe = UniGSFluxPipeline.from_pretrained(
+    "black-forest-labs/FLUX.1-Fill-dev", torch_dtype=torch.bfloat16
+)
+pipe = UniGSSD3Pipeline.from_pretrained(
+    "stabilityai/stable-diffusion-3.5-medium", torch_dtype=torch.bfloat16
+)
+pipe = UniGSZImagePipeline.from_pretrained("Tongyi-MAI/Z-Image-Turbo", torch_dtype=torch.bfloat16)
+pipe = UniGSPixArtPipeline.from_pretrained(
+    "PixArt-alpha/PixArt-XL-2-512-MS", torch_dtype=torch.float16
+)
 ```
 
 The other Table-2 tasks:
@@ -255,7 +262,7 @@ out = pipe.referring("dog", image=image, mask_image=region)
 out = pipe.segment(image)  # entity / panoptic
 ```
 
-CLI (`--pipeline` selects which class to bootstrap; `--backbone` is kept as an alias):
+CLI (`--pipeline` selects which class to `from_pretrained` when the path is a base Hub checkpoint):
 
 ```bash
 python src/infer_unigs.py \

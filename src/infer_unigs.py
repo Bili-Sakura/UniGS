@@ -44,16 +44,15 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from unigs import adapt_unigs_unet
 from unigs.backbones import (
-    INPAINTING_BACKBONES,
+    BACKBONES,
     default_dit_guidance,
     detect_dit_family_from_path,
     resolve_backbone,
     resolve_dit_family,
 )
 from unigs.colormap import ProgressiveDichotomyModule
-from unigs.pipelines import load_base_pipeline, load_saved_unigs_pipeline
+from unigs.pipelines import load_unigs_pipeline
 from unigs.prompts import TASK_NAMES
 
 
@@ -61,22 +60,21 @@ def parse_args():
     parser = argparse.ArgumentParser(description="UniGS inference.")
     parser.add_argument(
         "--pipeline",
-        "--backbone",
-        dest="pipeline",
         type=str,
         default="sd15",
-        choices=list(INPAINTING_BACKBONES),
+        choices=list(BACKBONES),
         help=(
-            "Which UniGS pipeline to bootstrap from the Hub: sd15/sd21 → UniGSPipeline, "
-            "flux → UniGSFluxPipeline, sd3 → UniGSSD3Pipeline, z_image → UniGSZImagePipeline, "
-            "pixart → UniGSPixArtPipeline. Ignored for a trained UniGS save dir."
+            "Which UniGS class to `from_pretrained` when bootstrapping a Hub checkpoint: "
+            "sd15/sd21 → UniGSPipeline, flux → UniGSFluxPipeline, sd3 → UniGSSD3Pipeline, "
+            "z_image → UniGSZImagePipeline, pixart → UniGSPixArtPipeline. "
+            "A trained UniGS save dir is selected from `model_index.json` `_class_name`."
         ),
     )
     parser.add_argument(
         "--pretrained-model",
         type=str,
         default=None,
-        help="Trained UniGS output dir, or a Hub id / local path for the selected pipeline.",
+        help="Hub id, local Diffusers dir, or trained UniGS `save_pretrained` directory.",
     )
     parser.add_argument("--task", type=str, default="inpainting", choices=list(TASK_NAMES))
     parser.add_argument("--prompt", type=str, default=None)
@@ -93,21 +91,8 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--pdm-delta", type=float, default=10.0)
-    parser.add_argument(
-        "--from-base",
-        "--from-inpainting",
-        dest="from_base",
-        action="store_true",
-        help="Adapt a base Hub checkpoint instead of loading a trained UniGS directory.",
-    )
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp32", "fp16", "bf16"])
     return parser.parse_args()
-
-
-def _is_trained_unigs_dir(path: str) -> bool:
-    return os.path.isdir(path) and (
-        os.path.isdir(os.path.join(path, "unet")) or os.path.isdir(os.path.join(path, "transformer"))
-    )
 
 
 def main():
@@ -115,22 +100,15 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    family = resolve_dit_family(args.pipeline) or detect_dit_family_from_path(args.pretrained_model)
+    checkpoint = resolve_backbone(
+        backbone=args.pipeline,
+        pretrained_model_name_or_path=args.pretrained_model,
+    )
+    family = resolve_dit_family(args.pipeline) or detect_dit_family_from_path(checkpoint)
     if args.guidance_scale is None:
         args.guidance_scale = default_dit_guidance(family) if family else 7.5
 
-    if args.pretrained_model and _is_trained_unigs_dir(args.pretrained_model) and not args.from_base:
-        pipeline = load_saved_unigs_pipeline(args.pretrained_model, torch_dtype=dtype)
-        if getattr(getattr(pipeline, "unet", None), "config", None) is not None:
-            if getattr(pipeline.unet.config, "in_channels", None) != 13:
-                pipeline.unet = adapt_unigs_unet(pipeline.unet)
-    else:
-        checkpoint = resolve_backbone(
-            backbone=args.pipeline,
-            pretrained_model_name_or_path=args.pretrained_model,
-        )
-        pipeline = load_base_pipeline(family, checkpoint, torch_dtype=dtype)
-
+    pipeline = load_unigs_pipeline(checkpoint, family=family, torch_dtype=dtype)
     pipeline = pipeline.to(device)
     pipeline.pdm = ProgressiveDichotomyModule(delta=args.pdm_delta, include_background=args.task == "entity")
 

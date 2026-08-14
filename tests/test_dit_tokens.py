@@ -278,12 +278,24 @@ class TestPerModelPipelines(unittest.TestCase):
     """AST checks so pipeline modules stay importable without Diffusers."""
 
     _UNIGS = os.path.join(os.path.dirname(__file__), "..", "src", "unigs")
-    _FACTORIES = (
-        ("pipeline_unigs.py", "UniGSPipeline", ("from_inpainting", "from_sd15", "from_sd21")),
-        ("pipeline_unigs_flux.py", "UniGSFluxPipeline", ("from_fill",)),
-        ("pipeline_unigs_sd3.py", "UniGSSD3Pipeline", ("from_sd3",)),
-        ("pipeline_unigs_zimage.py", "UniGSZImagePipeline", ("from_zimage",)),
-        ("pipeline_unigs_pixart.py", "UniGSPixArtPipeline", ("from_pixart", "from_pixart_1024")),
+    _PIPELINES = (
+        ("pipeline_unigs.py", "UniGSPipeline"),
+        ("pipeline_unigs_flux.py", "UniGSFluxPipeline"),
+        ("pipeline_unigs_sd3.py", "UniGSSD3Pipeline"),
+        ("pipeline_unigs_zimage.py", "UniGSZImagePipeline"),
+        ("pipeline_unigs_pixart.py", "UniGSPixArtPipeline"),
+    )
+    _REMOVED_FACTORIES = (
+        "from_inpainting",
+        "from_sd15",
+        "from_sd21",
+        "from_stable_diffusion",
+        "from_fill",
+        "from_sd3",
+        "from_zimage",
+        "from_pixart",
+        "from_pixart_1024",
+        "from_backbone",
     )
 
     def _parse(self, filename: str):
@@ -308,20 +320,21 @@ class TestPerModelPipelines(unittest.TestCase):
     def test_combined_dit_pipeline_file_is_gone(self):
         self.assertFalse(os.path.isfile(os.path.join(self._UNIGS, "pipeline_unigs_dit.py")))
 
-    def test_each_model_has_its_own_pipeline_class_and_factory(self):
+    def test_legacy_aliases_are_gone(self):
+        self.assertFalse(hasattr(sys.modules["unigs.backbones"], "INPAINTING_BACKBONES"))
+        self.assertFalse(hasattr(sys.modules["unigs.backbones"], "resolve_inpainting_checkpoint"))
+
+    def test_each_model_loads_with_from_pretrained(self):
         import ast
 
-        for filename, class_name, factories in self._FACTORIES:
+        for filename, class_name in self._PIPELINES:
             tree = self._parse(filename)
             methods = self._class_methods(tree, class_name)
-            for factory in factories:
-                self.assertIn(factory, methods, f"{class_name}.{factory} missing in {filename}")
-                args = [arg.arg for arg in methods[factory].args.args]
-                self.assertNotIn(
-                    "backbone",
-                    args,
-                    f"{class_name}.{factory} must not take a `backbone` argument",
-                )
+            self.assertIn("from_pretrained", methods, f"{class_name}.from_pretrained missing in {filename}")
+            args = [arg.arg for arg in methods["from_pretrained"].args.args]
+            self.assertNotIn("backbone", args)
+            for removed in self._REMOVED_FACTORIES:
+                self.assertNotIn(removed, methods, f"{class_name}.{removed} should be removed")
             class_names = [node.name for node in tree.body if isinstance(node, ast.ClassDef)]
             self.assertNotIn("UniGSDiTPipeline", class_names)
 
@@ -329,6 +342,7 @@ class TestPerModelPipelines(unittest.TestCase):
         source_path = os.path.join(self._UNIGS, "pipelines.py")
         with open(source_path, encoding="utf-8") as handle:
             source = handle.read()
+        self.assertNotIn("UniGSDiTPipeline", source)
         for class_name in (
             "UniGSPipeline",
             "UniGSFluxPipeline",

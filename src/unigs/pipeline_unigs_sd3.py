@@ -16,11 +16,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import numpy as np
 import torch
-from transformers import CLIPTokenizer, T5TokenizerFast
 
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL
@@ -31,7 +30,7 @@ try:
 except ImportError:
     from diffusers import DiffusionPipeline
 
-from .backbones import SD3_CHECKPOINT, default_dit_guidance, default_dit_max_sequence_length
+from .backbones import default_dit_guidance, default_dit_max_sequence_length
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .dit import encode_sd3_prompt, forward_sd3_token_concat
 from .pipeline_unigs import PipelineImageInput, UniGSPipelineOutput, _as_mask_tensor, _as_pil_rgb, retrieve_timesteps
@@ -46,8 +45,6 @@ from .transformer import adapt_unigs_transformer
 
 
 logger = logging.get_logger(__name__)
-
-DEFAULT_SD3_CHECKPOINT = SD3_CHECKPOINT
 
 
 def _import_sd3():
@@ -120,63 +117,13 @@ class UniGSSD3Pipeline(DiffusionPipeline):
         self.pdm = ProgressiveDichotomyModule()
 
     @classmethod
-    def from_sd3(
-        cls,
-        pretrained_model_name_or_path: Optional[str] = None,
-        torch_dtype: Optional[torch.dtype] = None,
-        revision: Optional[str] = None,
-        variant: Optional[str] = None,
-        scheduler=None,
-        **kwargs,
-    ) -> "UniGSSD3Pipeline":
-        """Load SD 3.5 Medium and adapt it to UniGS context-token concat."""
-        SD3Transformer2DModel, FlowMatchEulerDiscreteScheduler, CLIPTextModelWithProjection, T5EncoderModel = _import_sd3()
-        pretrained_model_name_or_path = pretrained_model_name_or_path or DEFAULT_SD3_CHECKPOINT
-        load_kw = dict(revision=revision, variant=variant, torch_dtype=torch_dtype)
-        vae = AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae", **load_kw)
-        transformer = SD3Transformer2DModel.from_pretrained(
-            pretrained_model_name_or_path, subfolder="transformer", **load_kw
-        )
-        transformer = adapt_unigs_transformer(transformer, family="sd3")
-        tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer", revision=revision)
-        tokenizer_2 = CLIPTokenizer.from_pretrained(
-            pretrained_model_name_or_path, subfolder="tokenizer_2", revision=revision
-        )
-        try:
-            tokenizer_3 = T5TokenizerFast.from_pretrained(
-                pretrained_model_name_or_path, subfolder="tokenizer_3", revision=revision
-            )
-        except Exception:
-            tokenizer_3 = None
-        text_encoder = CLIPTextModelWithProjection.from_pretrained(
-            pretrained_model_name_or_path, subfolder="text_encoder", **load_kw
-        )
-        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-            pretrained_model_name_or_path, subfolder="text_encoder_2", **load_kw
-        )
-        try:
-            text_encoder_3 = T5EncoderModel.from_pretrained(
-                pretrained_model_name_or_path, subfolder="text_encoder_3", **load_kw
-            )
-        except Exception:
-            text_encoder_3 = None
-            tokenizer_3 = None
-        if scheduler is None:
-            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-                pretrained_model_name_or_path, subfolder="scheduler"
-            )
-        return cls(
-            vae=vae,
-            transformer=transformer,
-            tokenizer=tokenizer,
-            text_encoder=text_encoder,
-            tokenizer_2=tokenizer_2,
-            text_encoder_2=text_encoder_2,
-            tokenizer_3=tokenizer_3,
-            text_encoder_3=text_encoder_3,
-            scheduler=scheduler,
-            **kwargs,
-        )
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load a UniGS SD 3.5 pipeline or adapt a base SD 3.5 checkpoint."""
+        _import_sd3()
+        pipeline = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        if getattr(pipeline, "transformer", None) is not None:
+            pipeline.transformer = adapt_unigs_transformer(pipeline.transformer, family="sd3")
+        return pipeline
 
     def encode_prompt(
         self,

@@ -55,10 +55,10 @@ try:
 except ImportError:
     KarrasDiffusionSchedulers = object
 
-from .backbones import UNET_BACKBONES, is_dit_checkpoint
+from .backbones import is_dit_checkpoint
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .prompts import TASK_PROMPT_TEMPLATES, build_task_prompt
-from .unet import UNIGS_IN_CHANNELS, UNIGS_OUT_CHANNELS, adapt_unigs_unet
+from .unet import UNIGS_OUT_CHANNELS, adapt_unigs_unet
 
 
 logger = logging.get_logger(__name__)
@@ -219,19 +219,6 @@ class UniGSPipeline(DiffusionPipeline, StableDiffusionMixin):
     ):
         super().__init__()
 
-        if unet is not None:
-            in_ch = getattr(unet.config, "in_channels", None)
-            out_ch = getattr(unet.config, "out_channels", None)
-            if in_ch != UNIGS_IN_CHANNELS or out_ch != UNIGS_OUT_CHANNELS:
-                logger.warning(
-                    "UniGS expects a UNet with in_channels=%s and out_channels=%s, got %s / %s. "
-                    "Call `adapt_unigs_unet(unet)` (or `UniGSPipeline.from_inpainting`) before inference.",
-                    UNIGS_IN_CHANNELS,
-                    UNIGS_OUT_CHANNELS,
-                    in_ch,
-                    out_ch,
-                )
-
         self.register_modules(
             vae=vae,
             text_encoder=text_encoder,
@@ -254,83 +241,25 @@ class UniGSPipeline(DiffusionPipeline, StableDiffusionMixin):
         self.pdm = ProgressiveDichotomyModule()
 
     @classmethod
-    def from_inpainting(
-        cls,
-        pretrained_model_name_or_path: Optional[str] = None,
-        torch_dtype: Optional[torch.dtype] = None,
-        revision: Optional[str] = None,
-        variant: Optional[str] = None,
-        scheduler=None,
-        **kwargs,
-    ) -> "UniGSPipeline":
-        """Load an SD inpainting checkpoint and expand its UNet to UniGS channels.
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load a UniGS UNet pipeline or adapt an SD inpainting checkpoint.
 
-        Args:
-            pretrained_model_name_or_path:
-                Hub id or local path to an SD *inpainting* pipeline. Defaults to
-                SD 1.5 inpainting. For SD 2.1 use [`from_sd21`]. DiT checkpoints
-                belong on [`UniGSFluxPipeline`], [`UniGSSD3Pipeline`],
-                [`UniGSZImagePipeline`], or [`UniGSPixArtPipeline`].
+        Same contract as [`DiffusionPipeline.from_pretrained`]: pass a Hub id or
+        a local `save_pretrained` directory. An SD *inpainting* checkpoint is
+        expanded to 13-in / 8-out. DiT checkpoints belong on
+        [`UniGSFluxPipeline`], [`UniGSSD3Pipeline`], [`UniGSZImagePipeline`],
+        or [`UniGSPixArtPipeline`].
         """
-        pretrained_model_name_or_path = pretrained_model_name_or_path or UNET_BACKBONES["sd15"]
         if is_dit_checkpoint(pretrained_model_name_or_path):
             raise ValueError(
                 "UniGSPipeline is the SD inpainting UNet pipeline. Load a DiT with "
-                "`UniGSFluxPipeline.from_fill`, `UniGSSD3Pipeline.from_sd3`, "
-                "`UniGSZImagePipeline.from_zimage`, or `UniGSPixArtPipeline.from_pixart`."
+                "`UniGSFluxPipeline.from_pretrained`, `UniGSSD3Pipeline.from_pretrained`, "
+                "`UniGSZImagePipeline.from_pretrained`, or `UniGSPixArtPipeline.from_pretrained`."
             )
-        tokenizer = CLIPTokenizer.from_pretrained(
-            pretrained_model_name_or_path, subfolder="tokenizer", revision=revision
-        )
-        text_encoder = CLIPTextModel.from_pretrained(
-            pretrained_model_name_or_path,
-            subfolder="text_encoder",
-            revision=revision,
-            variant=variant,
-            torch_dtype=torch_dtype,
-        )
-        vae = AutoencoderKL.from_pretrained(
-            pretrained_model_name_or_path,
-            subfolder="vae",
-            revision=revision,
-            variant=variant,
-            torch_dtype=torch_dtype,
-        )
-        unet = UNet2DConditionModel.from_pretrained(
-            pretrained_model_name_or_path,
-            subfolder="unet",
-            revision=revision,
-            variant=variant,
-            torch_dtype=torch_dtype,
-        )
-        unet = adapt_unigs_unet(unet)
-        if scheduler is None:
-            from diffusers import DDIMScheduler
-
-            scheduler = DDIMScheduler.from_pretrained(pretrained_model_name_or_path, subfolder="scheduler")
-        return cls(
-            vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            unet=unet,
-            scheduler=scheduler,
-            **kwargs,
-        )
-
-    @classmethod
-    def from_sd15(cls, **kwargs) -> "UniGSPipeline":
-        """Load `stable-diffusion-v1-5/stable-diffusion-inpainting` as UniGS."""
-        return cls.from_inpainting(UNET_BACKBONES["sd15"], **kwargs)
-
-    @classmethod
-    def from_sd21(cls, **kwargs) -> "UniGSPipeline":
-        """Load `stabilityai/stable-diffusion-2-inpainting` as UniGS."""
-        return cls.from_inpainting(UNET_BACKBONES["sd21"], **kwargs)
-
-    @classmethod
-    def from_stable_diffusion(cls, pretrained_model_name_or_path: str, **kwargs) -> "UniGSPipeline":
-        """Deprecated alias for :meth:`from_inpainting`. The path must be an SD inpainting checkpoint."""
-        return cls.from_inpainting(pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs)
+        pipeline = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        if getattr(pipeline, "unet", None) is not None:
+            pipeline.unet = adapt_unigs_unet(pipeline.unet)
+        return pipeline
 
     def encode_prompt(
         self,

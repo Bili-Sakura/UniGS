@@ -47,11 +47,7 @@ except ImportError:  # pragma: no cover - older Diffusers without FLUX
     FluxTransformer2DModel = None  # type: ignore[misc, assignment]
     FlowMatchEulerDiscreteScheduler = None  # type: ignore[misc, assignment]
 
-from .backbones import (
-    FLUX_FILL_CHECKPOINT,
-    FLUX_LATENT_CHANNELS,
-    UNIGS_DIT_PACKED_IN_CHANNELS,
-)
+from .backbones import FLUX_LATENT_CHANNELS
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .pipeline_unigs import (
     PipelineImageInput,
@@ -158,16 +154,6 @@ class UniGSFluxPipeline(DiffusionPipeline):
                 "(`FluxTransformer2DModel`). Install `diffusers>=0.32.0`."
             )
 
-        in_ch = getattr(getattr(transformer, "config", None), "in_channels", None)
-        if in_ch is not None and int(in_ch) != UNIGS_DIT_PACKED_IN_CHANNELS:
-            logger.warning(
-                "UniGS DiT expects transformer.in_channels=%s (Fill-style channel concat), got %s. "
-                "Call `adapt_unigs_transformer(transformer)` or "
-                "`UniGSFluxPipeline.from_fill` before inference.",
-                UNIGS_DIT_PACKED_IN_CHANNELS,
-                in_ch,
-            )
-
         self.register_modules(
             vae=vae,
             text_encoder=text_encoder,
@@ -201,52 +187,17 @@ class UniGSFluxPipeline(DiffusionPipeline):
         self.pdm = ProgressiveDichotomyModule()
 
     @classmethod
-    def from_fill(
-        cls,
-        pretrained_model_name_or_path: Optional[str] = None,
-        torch_dtype: Optional[torch.dtype] = None,
-        revision: Optional[str] = None,
-        variant: Optional[str] = None,
-        scheduler=None,
-        **kwargs,
-    ) -> "UniGSFluxPipeline":
-        """Load FLUX.1-Fill-dev and adapt it to UniGS Fill-style channel concat."""
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load a UniGS FLUX pipeline or adapt FLUX.1-Fill-dev (Diffusers contract)."""
         if FluxTransformer2DModel is None or FlowMatchEulerDiscreteScheduler is None:
             raise ImportError(
                 "FLUX UniGS requires Diffusers with `FluxTransformer2DModel` "
                 "and `FlowMatchEulerDiscreteScheduler` (diffusers>=0.32.0)."
             )
-        pretrained_model_name_or_path = pretrained_model_name_or_path or FLUX_FILL_CHECKPOINT
-        load_kw = dict(revision=revision, variant=variant, torch_dtype=torch_dtype)
-        tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer", revision=revision)
-        tokenizer_2 = T5TokenizerFast.from_pretrained(
-            pretrained_model_name_or_path, subfolder="tokenizer_2", revision=revision
-        )
-        text_encoder = CLIPTextModel.from_pretrained(
-            pretrained_model_name_or_path, subfolder="text_encoder", **load_kw
-        )
-        text_encoder_2 = T5EncoderModel.from_pretrained(
-            pretrained_model_name_or_path, subfolder="text_encoder_2", **load_kw
-        )
-        vae = AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae", **load_kw)
-        transformer = FluxTransformer2DModel.from_pretrained(
-            pretrained_model_name_or_path, subfolder="transformer", **load_kw
-        )
-        transformer = adapt_unigs_transformer(transformer)
-        if scheduler is None:
-            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-                pretrained_model_name_or_path, subfolder="scheduler"
-            )
-        return cls(
-            vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            text_encoder_2=text_encoder_2,
-            tokenizer_2=tokenizer_2,
-            transformer=transformer,
-            scheduler=scheduler,
-            **kwargs,
-        )
+        pipeline = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        if getattr(pipeline, "transformer", None) is not None:
+            pipeline.transformer = adapt_unigs_transformer(pipeline.transformer, family="flux")
+        return pipeline
 
     def encode_prompt(
         self,

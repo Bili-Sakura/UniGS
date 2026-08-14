@@ -20,7 +20,6 @@ from typing import Callable, List, Optional, Union
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer
 
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL
@@ -31,7 +30,7 @@ try:
 except ImportError:
     from diffusers import DiffusionPipeline
 
-from .backbones import ZIMAGE_CHECKPOINT, default_dit_guidance, default_dit_max_sequence_length
+from .backbones import default_dit_guidance, default_dit_max_sequence_length
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .dit import encode_zimage_prompt, forward_zimage_omni
 from .pipeline_unigs import PipelineImageInput, UniGSPipelineOutput, _as_mask_tensor, _as_pil_rgb, retrieve_timesteps
@@ -46,8 +45,6 @@ from .transformer import adapt_unigs_transformer, calculate_shift
 
 
 logger = logging.get_logger(__name__)
-
-DEFAULT_ZIMAGE_CHECKPOINT = ZIMAGE_CHECKPOINT
 
 
 def _import_zimage():
@@ -111,49 +108,13 @@ class UniGSZImagePipeline(DiffusionPipeline):
         self.pdm = ProgressiveDichotomyModule()
 
     @classmethod
-    def from_zimage(
-        cls,
-        pretrained_model_name_or_path: Optional[str] = None,
-        torch_dtype: Optional[torch.dtype] = None,
-        revision: Optional[str] = None,
-        variant: Optional[str] = None,
-        scheduler=None,
-        **kwargs,
-    ) -> "UniGSZImagePipeline":
-        """Load Z-Image Turbo and adapt it to UniGS omni context-token concat."""
-        ZImageTransformer2DModel, FlowMatchEulerDiscreteScheduler = _import_zimage()
-        pretrained_model_name_or_path = pretrained_model_name_or_path or DEFAULT_ZIMAGE_CHECKPOINT
-        load_kw = dict(revision=revision, variant=variant, torch_dtype=torch_dtype)
-        vae = AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae", **load_kw)
-        transformer = ZImageTransformer2DModel.from_pretrained(
-            pretrained_model_name_or_path, subfolder="transformer", **load_kw
-        )
-        transformer = adapt_unigs_transformer(transformer, family="z_image")
-        tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path, subfolder="tokenizer", revision=revision
-        )
-        try:
-            from transformers import Qwen2Model
-
-            text_encoder = Qwen2Model.from_pretrained(
-                pretrained_model_name_or_path, subfolder="text_encoder", **load_kw
-            )
-        except Exception:
-            text_encoder = AutoModel.from_pretrained(
-                pretrained_model_name_or_path, subfolder="text_encoder", **load_kw
-            )
-        if scheduler is None:
-            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-                pretrained_model_name_or_path, subfolder="scheduler"
-            )
-        return cls(
-            vae=vae,
-            transformer=transformer,
-            tokenizer=tokenizer,
-            text_encoder=text_encoder,
-            scheduler=scheduler,
-            **kwargs,
-        )
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load a UniGS Z-Image pipeline or adapt a base Z-Image checkpoint."""
+        _import_zimage()
+        pipeline = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        if getattr(pipeline, "transformer", None) is not None:
+            pipeline.transformer = adapt_unigs_transformer(pipeline.transformer, family="z_image")
+        return pipeline
 
     def encode_prompt(
         self,
