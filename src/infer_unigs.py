@@ -24,6 +24,13 @@ Examples:
 
     python src/infer_unigs.py --backbone flux --task inpainting --prompt "dog" \\
         --image input.png --mask mask.png --output-dir out --dtype bf16
+
+    python src/infer_unigs.py --backbone sd3 --task inpainting --prompt "dog" \\
+        --image input.png --mask mask.png --output-dir out --dtype bf16
+
+    python src/infer_unigs.py --backbone z_image --task entity --image scene.png --dtype bf16
+
+    python src/infer_unigs.py --backbone pixart --task synthesis --colormap layout.png
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from unigs import UniGSPipeline, adapt_unigs_unet, resolve_inpainting_checkpoint
-from unigs.backbones import INPAINTING_BACKBONES, is_dit_checkpoint
+from unigs.backbones import INPAINTING_BACKBONES, default_dit_guidance, detect_dit_family_from_path, is_dit_checkpoint
 from unigs.colormap import ProgressiveDichotomyModule
 from unigs.prompts import TASK_NAMES
 
@@ -50,13 +57,13 @@ def parse_args():
         type=str,
         default="sd15",
         choices=list(INPAINTING_BACKBONES),
-        help="SD inpainting or FLUX Fill checkpoint when bootstrapping from the Hub (ignored for trained UniGS dirs).",
+        help="SD inpainting or DiT checkpoint when bootstrapping from the Hub (ignored for trained UniGS dirs).",
     )
     parser.add_argument(
         "--pretrained-model",
         type=str,
         default=None,
-        help="Trained UniGS output dir, or an SD inpainting Hub id / local path.",
+        help="Trained UniGS output dir, or an SD inpainting / DiT Hub id / local path.",
     )
     parser.add_argument("--task", type=str, default="inpainting", choices=list(TASK_NAMES))
     parser.add_argument("--prompt", type=str, default=None)
@@ -65,13 +72,13 @@ def parse_args():
     parser.add_argument("--colormap", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default="unigs-output")
     parser.add_argument("--num-inference-steps", type=int, default=50)
-    parser.add_argument("--guidance-scale", type=float, default=None, help="CFG / FLUX guidance. Defaults to 7.5 (UNet) or 30 (FLUX Fill).")
+    parser.add_argument("--guidance-scale", type=float, default=None, help="CFG / DiT guidance. Defaults: 7.5 UNet, 30 FLUX, 4.5 SD3/PixArt, 0 Z-Image.")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--pdm-delta", type=float, default=10.0)
     parser.add_argument(
         "--from-inpainting",
         action="store_true",
-        help="Load and adapt an SD inpainting or FLUX Fill checkpoint instead of a trained UniGS directory.",
+        help="Load and adapt an SD inpainting or DiT checkpoint instead of a trained UniGS directory.",
     )
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp32", "fp16", "bf16"])
     return parser.parse_args()
@@ -92,17 +99,25 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dit = is_dit_checkpoint(args.backbone) or is_dit_checkpoint(args.pretrained_model)
+    family = detect_dit_family_from_path(args.backbone) or detect_dit_family_from_path(args.pretrained_model)
+    dit = family is not None or is_dit_checkpoint(args.backbone) or is_dit_checkpoint(args.pretrained_model)
     if args.pretrained_model and _is_dit_dir(args.pretrained_model):
         dit = True
+        family = family or detect_dit_family_from_path(args.pretrained_model) or "flux"
     if args.guidance_scale is None:
-        args.guidance_scale = 30.0 if dit else 7.5
+        args.guidance_scale = default_dit_guidance(family) if dit else 7.5
 
     if args.pretrained_model and _is_trained_unigs_dir(args.pretrained_model) and not args.from_inpainting:
         if _is_dit_dir(args.pretrained_model):
-            from unigs.pipeline_unigs_flux import UniGSFluxPipeline
+            family = detect_dit_family_from_path(args.pretrained_model) or family or "flux"
+            if family == "flux":
+                from unigs.pipeline_unigs_flux import UniGSFluxPipeline
 
-            pipeline = UniGSFluxPipeline.from_pretrained(args.pretrained_model, torch_dtype=dtype)
+                pipeline = UniGSFluxPipeline.from_pretrained(args.pretrained_model, torch_dtype=dtype)
+            else:
+                from unigs.pipeline_unigs_dit import UniGSDiTPipeline
+
+                pipeline = UniGSDiTPipeline.from_pretrained(args.pretrained_model, torch_dtype=dtype)
         else:
             pipeline = UniGSPipeline.from_pretrained(args.pretrained_model, torch_dtype=dtype)
             if getattr(pipeline.unet.config, "in_channels", None) != 13:

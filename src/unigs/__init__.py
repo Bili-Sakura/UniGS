@@ -26,12 +26,14 @@ from .backbones import (
     BACKBONES,
     DEFAULT_BACKBONE,
     DIT_BACKBONES,
+    DIT_FAMILY_CHECKPOINTS,
     FLUX_FILL_CHECKPOINT,
     INPAINTING_BACKBONES,
     INPAINTING_UNET_IN_CHANNELS,
     UNET_BACKBONES,
     is_dit_checkpoint,
     resolve_backbone,
+    resolve_dit_family,
     resolve_inpainting_checkpoint,
 )
 from .coarse_mask import CoarseMaskGenerator
@@ -48,18 +50,25 @@ except ImportError:  # Diffusers without FLUX
     UniGSFluxPipeline = None  # type: ignore[misc, assignment]
     encode_flux_prompt = None  # type: ignore[misc, assignment]
 
+try:
+    from .pipeline_unigs_dit import UniGSDiTPipeline
+except ImportError:
+    UniGSDiTPipeline = None  # type: ignore[misc, assignment]
+
 
 __all__ = [
     "BACKBONES",
     "CoarseMaskGenerator",
     "DEFAULT_BACKBONE",
     "DIT_BACKBONES",
+    "DIT_FAMILY_CHECKPOINTS",
     "FLUX_FILL_CHECKPOINT",
     "INPAINTING_BACKBONES",
     "INPAINTING_UNET_IN_CHANNELS",
     "LocationAwarePalette",
     "ProgressiveDichotomyModule",
     "UNET_BACKBONES",
+    "UniGSDiTPipeline",
     "UniGSFluxPipeline",
     "UniGSInstanceDataset",
     "UniGSPipeline",
@@ -76,5 +85,6 @@ __all__ = [
     "is_dit_checkpoint",
     "pack_latents",
     "resolve_backbone",
+    "resolve_dit_family",
     "resolve_inpainting_checkpoint",
 ]

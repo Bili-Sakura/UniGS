@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Adapt FLUX.1-Fill-dev (DiT) to UniGS with context-token concatenation.
+"""Adapt DiT backbones to UniGS with context-token concatenation.
 
 FLUX Fill concatenates the packed noisy latents, packed masked-image latents,
 and packed mask **along the channel axis** (384-dim tokens). UniGS instead
@@ -25,7 +25,9 @@ first coordinate to distinguish:
 * ``2`` — control latent (context only)
 * ``3`` — coarse mask (context only)
 
-Only the image + colormap prefix is used for the flow-matching target.
+SD 3.5 and PixArt-α keep native ``in_channels`` and concat **after** patch
+embed (plus a zero-init stream embedding). Z-Image uses native omni mode.
+See ``dit.py``. Only the image + colormap prefix is the denoising target.
 """
 
 from __future__ import annotations
@@ -225,19 +227,37 @@ def calculate_shift(
     return image_seq_len * m + b
 
 
-def adapt_unigs_transformer(transformer, zero_init: bool = True):
-    """Map FLUX Fill's 384-in channel-concat embedder to UniGS 64-in token concat.
+def adapt_unigs_transformer(transformer, zero_init: bool = True, family: Optional[str] = None):
+    """Adapt a DiT transformer to UniGS context-token concat.
 
-    Fill ``x_embedder`` is ``Linear(384, inner_dim)`` over
-    ``cat(noisy, masked_image, mask)`` packed channels. UniGS keeps only the
-    first 64 columns — the packed noisy-latent projection — so every visual
-    stream (image, colormap, control, mask) shares the same 64-dim embedder
-    and is distinguished in sequence + RoPE instead of in channels.
+    * **FLUX Fill** — shrink ``x_embedder`` 384→64 by copying packed noisy-latent
+      columns. Streams share that embedder and are distinguished by sequence + RoPE.
+    * **SD 3.5 / PixArt-α** — keep native ``in_channels``; register a zero-init
+      ``unigs_stream_embed`` so stream 0 matches the pretrained image path.
+    * **Z-Image** — keep native omni embedders; mark ``unigs_dit_family``.
 
-    Already-adapted UniGS DiT checkpoints (64 in / 64 out) are returned as-is.
+    Already-adapted UniGS checkpoints are returned as-is.
     """
+    from .dit import ensure_unigs_stream_embed, infer_transformer_family
+
+    family = family or infer_transformer_family(transformer)
+    if family in {"sd3", "pixart"}:
+        ensure_unigs_stream_embed(transformer)
+        if hasattr(transformer, "register_to_config"):
+            transformer.register_to_config(unigs_dit_family=family)
+        logger.info("Registered UniGS stream embeddings on %s DiT (native in_channels).", family)
+        return transformer
+    if family == "z_image":
+        if hasattr(transformer, "register_to_config"):
+            transformer.register_to_config(unigs_dit_family=family)
+        logger.info("Z-Image DiT uses native omni context-token concat (no channel adapt).")
+        return transformer
+
     old_in = int(transformer.config.in_channels)
     old_out = int(getattr(transformer.config, "out_channels", None) or old_in)
+
+    if hasattr(transformer, "register_to_config"):
+        transformer.register_to_config(unigs_dit_family="flux")
 
     if old_in == UNIGS_DIT_PACKED_IN_CHANNELS and old_out == UNIGS_DIT_PACKED_OUT_CHANNELS:
         logger.info("Transformer already has UniGS DiT packed channels (64 in / 64 out).")

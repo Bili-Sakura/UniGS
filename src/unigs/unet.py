@@ -49,7 +49,7 @@ LATENT_CHANNELS = 4
 _INPAINTING_HINT = (
     "Use an SD inpainting checkpoint such as "
     f"`{INPAINTING_BACKBONES['sd15']}` or `{INPAINTING_BACKBONES['sd21']}`, "
-    "or the FLUX DiT backbone `--backbone flux` (`black-forest-labs/FLUX.1-Fill-dev`)."
+    "or a DiT backbone `--backbone flux|sd3|z_image|pixart`."
 )
 
 

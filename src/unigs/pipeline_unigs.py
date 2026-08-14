@@ -18,8 +18,8 @@ The UNet denoises concatenated image+colormap latents conditioned on a coarse
 mask, a control latent, and a task-prefixed CLIP prompt — the same protocol as
 training (arxiv:2312.01985). Backbone is Stable Diffusion 1.5 or 2.1 inpainting.
 
-For the FLUX.1-Fill-dev DiT backbone (context-token concat instead of channel
-concat), see [`UniGSFluxPipeline`].
+For DiT backbones (FLUX Fill, SD 3.5, Z-Image, PixArt-α; context-token concat
+instead of channel concat), see [`UniGSFluxPipeline`] and [`UniGSDiTPipeline`].
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ try:
 except ImportError:
     KarrasDiffusionSchedulers = object
 
-from .backbones import INPAINTING_BACKBONES, is_dit_checkpoint, resolve_inpainting_checkpoint
+from .backbones import INPAINTING_BACKBONES, is_dit_checkpoint, resolve_dit_family, resolve_inpainting_checkpoint
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .prompts import TASK_PROMPT_TEMPLATES, build_task_prompt
 from .unet import UNIGS_IN_CHANNELS, UNIGS_OUT_CHANNELS, adapt_unigs_unet
@@ -271,20 +271,20 @@ class UniGSPipeline(DiffusionPipeline, StableDiffusionMixin):
                 Hub id or local path to an SD *inpainting* pipeline. When omitted,
                 `backbone` selects the default checkpoint (`sd15` or `sd21`).
             backbone:
-                Shorthand for SD 1.5 / 2.1 inpainting (`sd15`, `sd21`) or
-                FLUX.1-Fill-dev (`flux` / `flux_fill`). DiT checkpoints are
-                dispatched to [`UniGSFluxPipeline`].
+                Shorthand for SD 1.5 / 2.1 inpainting (`sd15`, `sd21`) or a DiT
+                family (`flux`, `sd3`, `z_image`, `pixart`). DiT checkpoints are
+                dispatched to [`UniGSFluxPipeline`] / [`UniGSDiTPipeline`].
         """
         pretrained_model_name_or_path = resolve_inpainting_checkpoint(
             backbone=backbone,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
         )
         if is_dit_checkpoint(backbone) or is_dit_checkpoint(pretrained_model_name_or_path):
-            from .pipeline_unigs_flux import UniGSFluxPipeline
+            from .pipeline_unigs_dit import load_unigs_dit_pipeline
 
-            return UniGSFluxPipeline.from_fill(
+            return load_unigs_dit_pipeline(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
-                backbone=backbone,
+                backbone=backbone or resolve_dit_family(pretrained_model_name_or_path) or "flux",
                 torch_dtype=torch_dtype,
                 revision=revision,
                 variant=variant,
