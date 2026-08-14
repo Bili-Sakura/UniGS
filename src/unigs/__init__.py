@@ -51,9 +51,19 @@ except ImportError:  # Diffusers without FLUX
     encode_flux_prompt = None  # type: ignore[misc, assignment]
 
 try:
-    from .pipeline_unigs_dit import UniGSDiTPipeline
+    from .pipeline_unigs_sd3 import UniGSSD3Pipeline
 except ImportError:
-    UniGSDiTPipeline = None  # type: ignore[misc, assignment]
+    UniGSSD3Pipeline = None  # type: ignore[misc, assignment]
+
+try:
+    from .pipeline_unigs_zimage import UniGSZImagePipeline
+except ImportError:
+    UniGSZImagePipeline = None  # type: ignore[misc, assignment]
+
+try:
+    from .pipeline_unigs_pixart import UniGSPixArtPipeline
+except ImportError:
+    UniGSPixArtPipeline = None  # type: ignore[misc, assignment]
 
 
 __all__ = [
@@ -68,8 +78,10 @@ __all__ = [
     "LocationAwarePalette",
     "ProgressiveDichotomyModule",
     "UNET_BACKBONES",
-    "UniGSDiTPipeline",
     "UniGSFluxPipeline",
+    "UniGSSD3Pipeline",
+    "UniGSPixArtPipeline",
+    "UniGSZImagePipeline",
     "UniGSInstanceDataset",
     "UniGSPipeline",
     "UniGSPipelineOutput",

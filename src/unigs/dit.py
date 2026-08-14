@@ -578,3 +578,29 @@ def pixart_added_cond_kwargs(
         batch_size * cfg_multiplier, 1
     )
     return {"resolution": resolution, "aspect_ratio": aspect_ratio}
+
+
+def load_dit_transformer(family: str, pretrained_model_name_or_path: str, **load_kw):
+    """Load a spatial DiT transformer and adapt it for UniGS token / omni concat.
+
+    FLUX Fill is adapted in :func:`unigs.transformer.adapt_unigs_transformer` from
+    the FLUX pipeline, not here.
+    """
+    if family == "sd3":
+        from .pipeline_unigs_sd3 import _import_sd3
+
+        cls = _import_sd3()[0]
+    elif family == "z_image":
+        from .pipeline_unigs_zimage import _import_zimage
+
+        cls = _import_zimage()[0]
+    elif family == "pixart":
+        from .pipeline_unigs_pixart import _import_pixart
+
+        cls = _import_pixart()[0]
+    else:
+        raise ValueError(f"Unsupported spatial DiT family '{family}'. Use UniGSFluxPipeline for FLUX.")
+    from .transformer import adapt_unigs_transformer
+
+    transformer = cls.from_pretrained(pretrained_model_name_or_path, subfolder="transformer", **load_kw)
+    return adapt_unigs_transformer(transformer, family=family)

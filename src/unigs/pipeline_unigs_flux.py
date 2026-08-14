@@ -51,7 +51,6 @@ from .backbones import (
     FLUX_FILL_CHECKPOINT,
     FLUX_LATENT_CHANNELS,
     UNIGS_DIT_PACKED_IN_CHANNELS,
-    resolve_backbone,
 )
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .pipeline_unigs import (
@@ -205,7 +204,6 @@ class UniGSFluxPipeline(DiffusionPipeline):
     def from_fill(
         cls,
         pretrained_model_name_or_path: Optional[str] = None,
-        backbone: str = "flux",
         torch_dtype: Optional[torch.dtype] = None,
         revision: Optional[str] = None,
         variant: Optional[str] = None,
@@ -218,10 +216,7 @@ class UniGSFluxPipeline(DiffusionPipeline):
                 "FLUX UniGS requires Diffusers with `FluxTransformer2DModel` "
                 "and `FlowMatchEulerDiscreteScheduler` (diffusers>=0.32.0)."
             )
-        pretrained_model_name_or_path = resolve_backbone(
-            backbone=backbone,
-            pretrained_model_name_or_path=pretrained_model_name_or_path or FLUX_FILL_CHECKPOINT,
-        )
+        pretrained_model_name_or_path = pretrained_model_name_or_path or FLUX_FILL_CHECKPOINT
         load_kw = dict(revision=revision, variant=variant, torch_dtype=torch_dtype)
         tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer", revision=revision)
         tokenizer_2 = T5TokenizerFast.from_pretrained(

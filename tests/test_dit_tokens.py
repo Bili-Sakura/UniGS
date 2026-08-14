@@ -274,5 +274,70 @@ class SpatialTokenConcatTests(unittest.TestCase):
         )
 
 
+class TestPerModelPipelines(unittest.TestCase):
+    """AST checks so pipeline modules stay importable without Diffusers."""
+
+    _UNIGS = os.path.join(os.path.dirname(__file__), "..", "src", "unigs")
+    _FACTORIES = (
+        ("pipeline_unigs.py", "UniGSPipeline", ("from_inpainting", "from_sd15", "from_sd21")),
+        ("pipeline_unigs_flux.py", "UniGSFluxPipeline", ("from_fill",)),
+        ("pipeline_unigs_sd3.py", "UniGSSD3Pipeline", ("from_sd3",)),
+        ("pipeline_unigs_zimage.py", "UniGSZImagePipeline", ("from_zimage",)),
+        ("pipeline_unigs_pixart.py", "UniGSPixArtPipeline", ("from_pixart", "from_pixart_1024")),
+    )
+
+    def _parse(self, filename: str):
+        import ast
+
+        path = os.path.join(self._UNIGS, filename)
+        with open(path, encoding="utf-8") as handle:
+            return ast.parse(handle.read(), filename=filename)
+
+    def _class_methods(self, tree, class_name: str):
+        import ast
+
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == class_name:
+                return {
+                    item.name: item
+                    for item in node.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                }
+        self.fail(f"class {class_name} not found")
+
+    def test_combined_dit_pipeline_file_is_gone(self):
+        self.assertFalse(os.path.isfile(os.path.join(self._UNIGS, "pipeline_unigs_dit.py")))
+
+    def test_each_model_has_its_own_pipeline_class_and_factory(self):
+        import ast
+
+        for filename, class_name, factories in self._FACTORIES:
+            tree = self._parse(filename)
+            methods = self._class_methods(tree, class_name)
+            for factory in factories:
+                self.assertIn(factory, methods, f"{class_name}.{factory} missing in {filename}")
+                args = [arg.arg for arg in methods[factory].args.args]
+                self.assertNotIn(
+                    "backbone",
+                    args,
+                    f"{class_name}.{factory} must not take a `backbone` argument",
+                )
+            class_names = [node.name for node in tree.body if isinstance(node, ast.ClassDef)]
+            self.assertNotIn("UniGSDiTPipeline", class_names)
+
+    def test_saved_loader_maps_per_model_class_names(self):
+        source_path = os.path.join(self._UNIGS, "pipelines.py")
+        with open(source_path, encoding="utf-8") as handle:
+            source = handle.read()
+        for class_name in (
+            "UniGSPipeline",
+            "UniGSFluxPipeline",
+            "UniGSSD3Pipeline",
+            "UniGSZImagePipeline",
+            "UniGSPixArtPipeline",
+        ):
+            self.assertIn(f'"{class_name}"', source)
+
+
 if __name__ == "__main__":
     unittest.main()

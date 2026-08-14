@@ -48,8 +48,10 @@ LATENT_CHANNELS = 4
 
 _INPAINTING_HINT = (
     "Use an SD inpainting checkpoint such as "
-    f"`{INPAINTING_BACKBONES['sd15']}` or `{INPAINTING_BACKBONES['sd21']}`, "
-    "or a DiT backbone `--backbone flux|sd3|z_image|pixart`."
+    f"`{INPAINTING_BACKBONES['sd15']}` or `{INPAINTING_BACKBONES['sd21']}` "
+    "with `UniGSPipeline.from_inpainting`. DiT models use "
+    "`UniGSFluxPipeline.from_fill`, `UniGSSD3Pipeline.from_sd3`, "
+    "`UniGSZImagePipeline.from_zimage`, or `UniGSPixArtPipeline.from_pixart`."
 )
 
 

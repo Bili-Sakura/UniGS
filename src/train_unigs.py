@@ -836,15 +836,15 @@ def _dit_training_step(
 
 def _dit_transformer_class(family: str):
     if family == "sd3":
-        from unigs.pipeline_unigs_dit import _import_sd3
+        from unigs.pipeline_unigs_sd3 import _import_sd3
 
         return _import_sd3()[0]
     if family == "z_image":
-        from unigs.pipeline_unigs_dit import _import_zimage
+        from unigs.pipeline_unigs_zimage import _import_zimage
 
         return _import_zimage()[0]
     if family == "pixart":
-        from unigs.pipeline_unigs_dit import _import_pixart
+        from unigs.pipeline_unigs_pixart import _import_pixart
 
         return _import_pixart()[0]
     return _import_flux()[0]
@@ -887,8 +887,6 @@ def _build_validation_pipeline(
                 transformer=unwrap_model(accelerator, transformer),
                 scheduler=scheduler,
             )
-        from unigs.pipeline_unigs_dit import UniGSDiTPipeline
-
         if dit_uses_flow_matching(family):
             from diffusers import FlowMatchEulerDiscreteScheduler
 
@@ -902,17 +900,41 @@ def _build_validation_pipeline(
             if final
             else scheduler_cls.from_config(noise_scheduler.config)
         )
-        return UniGSDiTPipeline(
-            vae=unwrap_model(accelerator, vae),
-            transformer=unwrap_model(accelerator, transformer),
+        vae_u = unwrap_model(accelerator, vae)
+        transformer_u = unwrap_model(accelerator, transformer)
+        text_u = unwrap_model(accelerator, text_encoder)
+        if family == "sd3":
+            from unigs.pipeline_unigs_sd3 import UniGSSD3Pipeline
+
+            return UniGSSD3Pipeline(
+                vae=vae_u,
+                transformer=transformer_u,
+                tokenizer=tokenizer,
+                text_encoder=text_u,
+                tokenizer_2=tokenizer_2,
+                text_encoder_2=None if text_encoder_2 is None else unwrap_model(accelerator, text_encoder_2),
+                tokenizer_3=tokenizer_3,
+                text_encoder_3=None if text_encoder_3 is None else unwrap_model(accelerator, text_encoder_3),
+                scheduler=scheduler,
+            )
+        if family == "z_image":
+            from unigs.pipeline_unigs_zimage import UniGSZImagePipeline
+
+            return UniGSZImagePipeline(
+                vae=vae_u,
+                transformer=transformer_u,
+                tokenizer=tokenizer,
+                text_encoder=text_u,
+                scheduler=scheduler,
+            )
+        from unigs.pipeline_unigs_pixart import UniGSPixArtPipeline
+
+        return UniGSPixArtPipeline(
+            vae=vae_u,
+            transformer=transformer_u,
             tokenizer=tokenizer,
-            text_encoder=unwrap_model(accelerator, text_encoder),
-            tokenizer_2=tokenizer_2,
-            text_encoder_2=None if text_encoder_2 is None else unwrap_model(accelerator, text_encoder_2),
-            tokenizer_3=tokenizer_3,
-            text_encoder_3=None if text_encoder_3 is None else unwrap_model(accelerator, text_encoder_3),
+            text_encoder=text_u,
             scheduler=scheduler,
-            unigs_dit_family=family,
         )
     scheduler = (
         DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
@@ -1042,7 +1064,7 @@ def main():
     tokenizer_3 = None
     text_encoder_3 = None
     if args.dit:
-        from unigs.pipeline_unigs_dit import load_dit_transformer
+        from unigs.dit import load_dit_transformer
 
         vae = AutoencoderKL.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
@@ -1072,8 +1094,9 @@ def main():
             )
             transformer = adapt_unigs_transformer(transformer, family="flux")
         elif args.dit_family == "sd3":
-            from unigs.pipeline_unigs_dit import _import_sd3
             from transformers import CLIPTextModelWithProjection, T5EncoderModel, T5TokenizerFast
+
+            from unigs.pipeline_unigs_sd3 import _import_sd3
 
             _, FlowMatchEulerDiscreteScheduler, CLIPTextModelWithProjection, T5EncoderModel = _import_sd3()
             noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -1116,7 +1139,7 @@ def main():
         elif args.dit_family == "z_image":
             from transformers import AutoModel, AutoTokenizer
 
-            from unigs.pipeline_unigs_dit import _import_zimage
+            from unigs.pipeline_unigs_zimage import _import_zimage
 
             _, FlowMatchEulerDiscreteScheduler = _import_zimage()
             noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -1149,7 +1172,7 @@ def main():
         elif args.dit_family == "pixart":
             from transformers import T5EncoderModel, T5Tokenizer, T5TokenizerFast
 
-            from unigs.pipeline_unigs_dit import _import_pixart
+            from unigs.pipeline_unigs_pixart import _import_pixart
 
             try:
                 noise_scheduler = DDPMScheduler.from_pretrained(

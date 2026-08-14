@@ -46,13 +46,17 @@ This tree is intentionally close to a Diffusers research example:
 ```
 src/
   train_unigs.py              # Accelerate trainer (like examples/instruct_pix2pix)
-  infer_unigs.py              # CLI around the pipeline
+  infer_unigs.py              # CLI around the per-model pipelines
   requirements.txt
   unigs/
-    pipeline_unigs.py         # DiffusionPipeline (community-pipeline style)
-    pipeline_unigs_flux.py    # FLUX Fill DiT pipeline (Fill-style channel concat)
-    pipeline_unigs_dit.py     # SD 3.5 / Z-Image / PixArt-α DiT pipeline (token concat)
-    backbones.py              # sd15 / sd21 / flux / sd3 / z_image / pixart Hub ids
+    pipeline_unigs.py         # UniGSPipeline (SD 1.5 / 2.1 inpainting UNet)
+    pipeline_unigs_flux.py    # UniGSFluxPipeline (Fill-style channel concat)
+    pipeline_unigs_sd3.py     # UniGSSD3Pipeline (context-token concat)
+    pipeline_unigs_zimage.py  # UniGSZImagePipeline (omni context tokens)
+    pipeline_unigs_pixart.py  # UniGSPixArtPipeline (context-token concat)
+    pipeline_unigs_common.py  # shared task / latent helpers
+    pipelines.py              # load by family or saved `_class_name`
+    backbones.py              # train/infer Hub-id shorthands
     unet.py                   # 9 → 13-in, 4 → 8-out adapter
     transformer.py            # Fill 384-in → UniGS 448-in channel-concat adapter
     dit.py                    # SD3 / PixArt sequence concat + Z-Image omni
@@ -70,7 +74,7 @@ tests/
 pip install -r src/requirements.txt
 ```
 
-Supported backbones (use `--backbone` or pass the Hub id explicitly):
+Each model family has its own pipeline class and factory (no `backbone=` argument on the pipeline). Training `--backbone` is only a Hub-id shorthand:
 
 | Shorthand | Checkpoint | Conditioning |
 | --- | --- | --- |
@@ -124,7 +128,7 @@ accelerate launch src/train_unigs.py \
 
 `--task` can be `inpainting`, `synthesis`, `referring`, `entity`, or `joint` (sample ratios 0.3 / 0.3 / 0.2 / 0.2 from the supplementary). Referring training randomly replaces category names with negatives (`--referring_neg_prob`) so the text prompt has to match the coarse-mask region.
 
-The run writes a full `UniGSPipeline` via `save_pretrained`, so the UNet config records `in_channels=13` and `out_channels=8`.
+The run writes a full `UniGSPipeline` via `save_pretrained`, so the UNet config records `in_channels=13` and `out_channels=8`. DiT runs write the matching class (`UniGSFluxPipeline`, `UniGSSD3Pipeline`, `UniGSZImagePipeline`, or `UniGSPixArtPipeline`).
 
 FLUX.1-Fill-dev (Fill-style channel concat; LoRA is recommended because the transformer is 12B):
 
@@ -221,16 +225,26 @@ out.colormaps[0].save("colormap.png")
 # out.masks is a list of binary entity maps from the progressive dichotomy module
 ```
 
-Bootstrap directly from an inpainting checkpoint (channels expanded; weights are pretrained-inpainting + zero-init colormap branches — fine-tune before serious use):
+Bootstrap from a base Hub checkpoint (channels / adapters expanded; fine-tune before serious use). Each family has its own class — there is no `backbone=` pipeline argument:
 
 ```python
-from unigs import UniGSPipeline
+from unigs import (
+    UniGSFluxPipeline,
+    UniGSPipeline,
+    UniGSPixArtPipeline,
+    UniGSSD3Pipeline,
+    UniGSZImagePipeline,
+)
 
-pipe = UniGSPipeline.from_inpainting(backbone="sd15", torch_dtype=torch.float16)
+pipe = UniGSPipeline.from_sd15(torch_dtype=torch.float16)
+pipe = UniGSPipeline.from_sd21(torch_dtype=torch.float16)
 # or: UniGSPipeline.from_inpainting("stabilityai/stable-diffusion-2-inpainting")
-# DiT: UniGSPipeline.from_inpainting(backbone="flux", torch_dtype=torch.bfloat16)
-#   dispatches to UniGSFluxPipeline (Fill-style channel concat).
-# Also: backbone="sd3" | "z_image" | "pixart" → UniGSDiTPipeline.
+
+pipe = UniGSFluxPipeline.from_fill(torch_dtype=torch.bfloat16)
+pipe = UniGSSD3Pipeline.from_sd3(torch_dtype=torch.bfloat16)
+pipe = UniGSZImagePipeline.from_zimage(torch_dtype=torch.bfloat16)
+pipe = UniGSPixArtPipeline.from_pixart(torch_dtype=torch.float16)
+# PixArt 1024: UniGSPixArtPipeline.from_pixart("PixArt-alpha/PixArt-XL-2-1024-MS")
 ```
 
 The other Table-2 tasks:
@@ -241,11 +255,11 @@ out = pipe.referring("dog", image=image, mask_image=region)
 out = pipe.segment(image)  # entity / panoptic
 ```
 
-CLI:
+CLI (`--pipeline` selects which class to bootstrap; `--backbone` is kept as an alias):
 
 ```bash
 python src/infer_unigs.py \
-  --backbone sd15 \
+  --pipeline sd15 \
   --task inpainting \
   --prompt dog \
   --image scene.png \
@@ -257,7 +271,7 @@ FLUX Fill (guidance default 30; bf16 recommended):
 
 ```bash
 python src/infer_unigs.py \
-  --backbone flux \
+  --pipeline flux \
   --task inpainting \
   --prompt dog \
   --image scene.png \
@@ -270,7 +284,7 @@ SD 3.5 Medium (guidance default 4.5):
 
 ```bash
 python src/infer_unigs.py \
-  --backbone sd3 \
+  --pipeline sd3 \
   --task inpainting \
   --prompt dog \
   --image scene.png \
@@ -279,7 +293,7 @@ python src/infer_unigs.py \
   --output-dir out
 ```
 
-Z-Image (guidance default 0) and PixArt-α (guidance default 4.5) use the same CLI with `--backbone z_image` or `--backbone pixart`.
+Z-Image (guidance default 0) and PixArt-α (guidance default 4.5) use the same CLI with `--pipeline z_image` or `--pipeline pixart`.
 
 ## Method notes
 
@@ -295,8 +309,8 @@ Z-Image (guidance default 0) and PixArt-α (guidance default 4.5) use the same C
 
 To upstream this as an official example:
 
-1. Move `src/unigs/pipeline_unigs.py` → `examples/community/pipeline_unigs.py` (inline the small helpers, or keep the package).
+1. Move each `src/unigs/pipeline_unigs*.py` → `examples/community/` (keep one file per model family).
 2. Move `src/train_unigs.py` + `src/unigs/` → `examples/research_projects/unigs/`.
-3. Load with `DiffusionPipeline.from_pretrained(..., custom_pipeline="pipeline_unigs")` once the community file is in tree.
+3. Load with `DiffusionPipeline.from_pretrained(..., custom_pipeline="pipeline_unigs")` (or the matching `pipeline_unigs_flux` / `_sd3` / `_zimage` / `_pixart` file) once the community files are in tree.
 
 No custom CUDA ops, no extra segmentation losses — UNet training is standard latent-diffusion MSE on the 8-channel noise; FLUX / SD 3.5 / Z-Image training is flow-matching MSE on image + colormap latents; PixArt-α training is epsilon MSE on the same two streams.

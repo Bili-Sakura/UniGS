@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""UniGS inference pipeline (community / research-example style).
+"""UniGS inference pipeline for SD 1.5 / 2.1 inpainting UNets.
 
 The UNet denoises concatenated image+colormap latents conditioned on a coarse
 mask, a control latent, and a task-prefixed CLIP prompt — the same protocol as
-training (arxiv:2312.01985). Backbone is Stable Diffusion 1.5 or 2.1 inpainting.
+training (arxiv:2312.01985).
 
-For DiT backbones: FLUX Fill uses Fill-style channel concat; SD 3.5, Z-Image, and
-PixArt-α use context-token concat. See [`UniGSFluxPipeline`] and [`UniGSDiTPipeline`].
+DiT models have their own pipelines: [`UniGSFluxPipeline`], [`UniGSSD3Pipeline`],
+[`UniGSZImagePipeline`], [`UniGSPixArtPipeline`].
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ try:
 except ImportError:
     KarrasDiffusionSchedulers = object
 
-from .backbones import INPAINTING_BACKBONES, is_dit_checkpoint, resolve_dit_family, resolve_inpainting_checkpoint
+from .backbones import UNET_BACKBONES, is_dit_checkpoint
 from .colormap import LocationAwarePalette, ProgressiveDichotomyModule
 from .prompts import TASK_PROMPT_TEMPLATES, build_task_prompt
 from .unet import UNIGS_IN_CHANNELS, UNIGS_OUT_CHANNELS, adapt_unigs_unet
@@ -257,7 +257,6 @@ class UniGSPipeline(DiffusionPipeline, StableDiffusionMixin):
     def from_inpainting(
         cls,
         pretrained_model_name_or_path: Optional[str] = None,
-        backbone: str = "sd15",
         torch_dtype: Optional[torch.dtype] = None,
         revision: Optional[str] = None,
         variant: Optional[str] = None,
@@ -268,28 +267,17 @@ class UniGSPipeline(DiffusionPipeline, StableDiffusionMixin):
 
         Args:
             pretrained_model_name_or_path:
-                Hub id or local path to an SD *inpainting* pipeline. When omitted,
-                `backbone` selects the default checkpoint (`sd15` or `sd21`).
-            backbone:
-                Shorthand for SD 1.5 / 2.1 inpainting (`sd15`, `sd21`) or a DiT
-                family (`flux`, `sd3`, `z_image`, `pixart`). DiT checkpoints are
-                dispatched to [`UniGSFluxPipeline`] / [`UniGSDiTPipeline`].
+                Hub id or local path to an SD *inpainting* pipeline. Defaults to
+                SD 1.5 inpainting. For SD 2.1 use [`from_sd21`]. DiT checkpoints
+                belong on [`UniGSFluxPipeline`], [`UniGSSD3Pipeline`],
+                [`UniGSZImagePipeline`], or [`UniGSPixArtPipeline`].
         """
-        pretrained_model_name_or_path = resolve_inpainting_checkpoint(
-            backbone=backbone,
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-        )
-        if is_dit_checkpoint(backbone) or is_dit_checkpoint(pretrained_model_name_or_path):
-            from .pipeline_unigs_dit import load_unigs_dit_pipeline
-
-            return load_unigs_dit_pipeline(
-                pretrained_model_name_or_path=pretrained_model_name_or_path,
-                backbone=backbone or resolve_dit_family(pretrained_model_name_or_path) or "flux",
-                torch_dtype=torch_dtype,
-                revision=revision,
-                variant=variant,
-                scheduler=scheduler,
-                **kwargs,
+        pretrained_model_name_or_path = pretrained_model_name_or_path or UNET_BACKBONES["sd15"]
+        if is_dit_checkpoint(pretrained_model_name_or_path):
+            raise ValueError(
+                "UniGSPipeline is the SD inpainting UNet pipeline. Load a DiT with "
+                "`UniGSFluxPipeline.from_fill`, `UniGSSD3Pipeline.from_sd3`, "
+                "`UniGSZImagePipeline.from_zimage`, or `UniGSPixArtPipeline.from_pixart`."
             )
         tokenizer = CLIPTokenizer.from_pretrained(
             pretrained_model_name_or_path, subfolder="tokenizer", revision=revision
@@ -328,6 +316,16 @@ class UniGSPipeline(DiffusionPipeline, StableDiffusionMixin):
             scheduler=scheduler,
             **kwargs,
         )
+
+    @classmethod
+    def from_sd15(cls, **kwargs) -> "UniGSPipeline":
+        """Load `stable-diffusion-v1-5/stable-diffusion-inpainting` as UniGS."""
+        return cls.from_inpainting(UNET_BACKBONES["sd15"], **kwargs)
+
+    @classmethod
+    def from_sd21(cls, **kwargs) -> "UniGSPipeline":
+        """Load `stabilityai/stable-diffusion-2-inpainting` as UniGS."""
+        return cls.from_inpainting(UNET_BACKBONES["sd21"], **kwargs)
 
     @classmethod
     def from_stable_diffusion(cls, pretrained_model_name_or_path: str, **kwargs) -> "UniGSPipeline":
